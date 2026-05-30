@@ -513,7 +513,7 @@ def kill_existing_openvpn_processes() -> None:
         # Terminate existing openvpn processes managing tun0 or using our vpngate configuration
         subprocess.run(["pkill", "-f", "openvpn.*tun0"], capture_output=True, timeout=2)
         subprocess.run(["pkill", "-f", "openvpn.*vpngate_data"], capture_output=True, timeout=2)
-        print("[Cleanup] Terminated existing eianun 二改版本 OpenVPN processes.", flush=True)
+        print("[Cleanup] Terminated existing Eianun免费聚合落地IP OpenVPN processes.", flush=True)
     except Exception as e:
         print(f"[Cleanup Error] Failed to kill existing OpenVPN processes: {e}", flush=True)
 
@@ -1121,7 +1121,7 @@ LOGIN_HTML = r"""<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>eianun 二改版本 - 安全登录</title>
+  <title>Eianun免费聚合落地IP - 安全登录</title>
   <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
   <style>
     :root {
@@ -1298,6 +1298,38 @@ LOGIN_HTML = r"""<!DOCTYPE html>
       cursor: not-allowed;
       transform: none !important;
     }
+
+
+    .login-progress {
+      display: none;
+      margin-top: 16px;
+      text-align: left;
+    }
+
+    .login-progress-text {
+      font-size: 13px;
+      color: var(--text-secondary);
+      margin-bottom: 8px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .login-progress-track {
+      height: 8px;
+      border-radius: 999px;
+      overflow: hidden;
+      background: rgba(255, 255, 255, 0.06);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+    }
+
+    .login-progress-bar {
+      width: 0%;
+      height: 100%;
+      border-radius: 999px;
+      background: var(--primary-gradient);
+      transition: width 0.35s ease;
+    }
   </style>
 </head>
 <body>
@@ -1308,7 +1340,7 @@ LOGIN_HTML = r"""<!DOCTYPE html>
           <path stroke-linecap="round" stroke-linejoin="round" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
         </svg>
       </div>
-      <h2 class="login-title">eianun 二改版本</h2>
+      <h2 class="login-title">Eianun免费聚合落地IP</h2>
       <p class="login-subtitle">请输入您的管理账号和安全密码以继续</p>
       
       <form id="login_form" onsubmit="handleLogin(event)">
@@ -1329,11 +1361,36 @@ LOGIN_HTML = r"""<!DOCTYPE html>
         <button type="submit" id="submit_btn" class="login-btn">
           <span>登录</span>
         </button>
+
+        <div id="login_progress" class="login-progress">
+          <div class="login-progress-text">
+            <span id="login_progress_text">正在准备登录...</span>
+            <span id="login_progress_percent">0%</span>
+          </div>
+          <div class="login-progress-track"><div id="login_progress_bar" class="login-progress-bar"></div></div>
+        </div>
       </form>
     </div>
   </div>
 
   <script>
+    function setLoginProgress(text, percent) {
+      const box = document.getElementById("login_progress");
+      const textEl = document.getElementById("login_progress_text");
+      const percentEl = document.getElementById("login_progress_percent");
+      const bar = document.getElementById("login_progress_bar");
+      box.style.display = "block";
+      textEl.textContent = text;
+      percentEl.textContent = `${percent}%`;
+      bar.style.width = `${percent}%`;
+    }
+
+    function resetLoginButton() {
+      const submitBtn = document.getElementById("submit_btn");
+      submitBtn.disabled = false;
+      submitBtn.querySelector("span").textContent = "登录";
+    }
+
     async function handleLogin(e) {
       e.preventDefault();
       const uname = document.getElementById("username").value;
@@ -1343,7 +1400,8 @@ LOGIN_HTML = r"""<!DOCTYPE html>
       
       errorText.style.display = "none";
       submitBtn.disabled = true;
-      submitBtn.querySelector("span").textContent = "正在验证...";
+      submitBtn.querySelector("span").textContent = "正在验证";
+      setLoginProgress("1/3 正在验证账号密码...", 28);
       
       try {
         const response = await fetch("./api/login", {
@@ -1351,21 +1409,29 @@ LOGIN_HTML = r"""<!DOCTYPE html>
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ username: uname, password: pwd })
         });
+        setLoginProgress("2/3 正在建立管理会话...", 58);
         
         const data = await response.json();
         if (response.ok && data.ok) {
-          window.location.reload();
+          submitBtn.querySelector("span").textContent = "验证成功";
+          setLoginProgress("3/3 登录成功，正在加载面板与节点状态...", 86);
+          setTimeout(() => {
+            setLoginProgress("正在进入控制面板，请稍候...", 100);
+          }, 250);
+          setTimeout(() => {
+            window.location.reload();
+          }, 650);
         } else {
+          setLoginProgress("验证失败，请检查账号密码", 100);
           errorText.textContent = data.error || "账号或密码不正确，请重新输入";
           errorText.style.display = "block";
-          submitBtn.disabled = false;
-          submitBtn.querySelector("span").textContent = "登录";
+          resetLoginButton();
         }
       } catch (err) {
+        setLoginProgress("连接服务器失败，请稍后重试", 100);
         errorText.textContent = "连接服务器失败，请稍后重试";
         errorText.style.display = "block";
-        submitBtn.disabled = false;
-        submitBtn.querySelector("span").textContent = "登录";
+        resetLoginButton();
       }
     }
   </script>
@@ -1378,7 +1444,7 @@ INDEX_HTML = r"""<!doctype html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>eianun 二改版本 节点池管理系统</title>
+  <title>Eianun免费聚合落地IP 节点池管理系统</title>
   <style>
     @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
     
@@ -2040,14 +2106,84 @@ INDEX_HTML = r"""<!doctype html>
       box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.2);
       background: rgba(15, 23, 42, 0.6);
     }
+
+
+    .page-loading {
+      position: fixed;
+      inset: 0;
+      z-index: 20000;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: rgba(9, 13, 22, 0.72);
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+    }
+
+    .page-loading-card {
+      width: min(420px, calc(100vw - 48px));
+      background: rgba(22, 30, 49, 0.92);
+      border: 1px solid var(--border-color);
+      border-radius: 18px;
+      padding: 24px;
+      box-shadow: 0 18px 48px rgba(0, 0, 0, 0.38);
+    }
+
+    .page-loading-title {
+      font-size: 18px;
+      font-weight: 700;
+      color: var(--text-primary);
+      margin-bottom: 8px;
+    }
+
+    .page-loading-desc {
+      font-size: 13px;
+      color: var(--text-secondary);
+      margin-bottom: 16px;
+      line-height: 1.5;
+    }
+
+    .page-loading-track {
+      height: 9px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.06);
+      overflow: hidden;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+    }
+
+    .page-loading-bar {
+      width: 0%;
+      height: 100%;
+      border-radius: 999px;
+      background: var(--primary-gradient);
+      transition: width 0.35s ease;
+    }
+
+    .page-loading-meta {
+      margin-top: 10px;
+      font-size: 12px;
+      color: var(--text-secondary);
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+    }
   </style>
 </head>
 <body>
+
+<div id="page_loading" class="page-loading">
+  <div class="page-loading-card">
+    <div class="page-loading-title">正在加载控制面板</div>
+    <div id="page_loading_desc" class="page-loading-desc">正在连接后端服务并读取节点状态...</div>
+    <div class="page-loading-track"><div id="page_loading_bar" class="page-loading-bar"></div></div>
+    <div class="page-loading-meta"><span id="page_loading_step">初始化</span><span id="page_loading_percent">0%</span></div>
+  </div>
+</div>
 <header>
   <div class="brand">
     <h1>
       <svg xmlns="http://www.w3.org/2000/svg" style="width:24px; height:24px; color:#818cf8;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" /></svg>
-      eianun 二改版本 节点管理系统
+      Eianun免费聚合落地IP 节点管理系统
     </h1>
     <div id="status" class="status"><span class="status-dot"></span>服务加载中...</div>
   </div>
@@ -2069,7 +2205,7 @@ INDEX_HTML = r"""<!doctype html>
       <div id="admin_dropdown" class="dropdown-content">
         <a href="javascript:void(0)" onclick="openSettingsModal()">
           <svg xmlns="http://www.w3.org/2000/svg" style="width:14px; height:14px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" /><path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
-          设置
+          面板设置
         </a>
         <a href="javascript:void(0)" onclick="logoutAdmin()" style="color: var(--danger); border-top: 1px solid rgba(255,255,255,0.05);">
           <svg xmlns="http://www.w3.org/2000/svg" style="width:14px; height:14px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" /></svg>
@@ -2200,7 +2336,7 @@ INDEX_HTML = r"""<!doctype html>
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px;">
         <h3 style="margin: 0; font-size: 18px; font-weight: 700; color: var(--text-primary); display: flex; align-items: center; gap: 8px;">
           <svg xmlns="http://www.w3.org/2000/svg" style="width:20px; height:20px; color: var(--primary);" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" /><path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
-          管理员设置
+          面板设置（账号 / 密码 / 端口 / 地区）
         </h3>
         <button type="button" onclick="closeSettingsModal()" style="background: transparent; border: none; padding: 4px; cursor: pointer; color: var(--text-secondary); width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; border-radius: 50%;" onmouseover="this.style.background='rgba(255,255,255,0.05)'" onmouseout="this.style.background='transparent'">
           <svg xmlns="http://www.w3.org/2000/svg" style="width:18px; height:18px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
@@ -2212,7 +2348,7 @@ INDEX_HTML = r"""<!doctype html>
 
       <form id="settings_form" onsubmit="saveSettings(event)">
         <div style="border-bottom: 1px solid rgba(255,255,255,0.05); padding-bottom: 16px; margin-bottom: 16px;">
-          <div style="font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-secondary); font-weight: 600; margin-bottom: 12px;">修改网页访问配置</div>
+          <div style="font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-secondary); font-weight: 600; margin-bottom: 12px;">面板访问与节点拉取配置</div>
           
           <div class="form-group" style="margin-bottom: 12px;">
             <label class="form-label" for="settings_port">网页端口</label>
@@ -2789,18 +2925,48 @@ $("btn_batch_test").onclick = async () => {
   }
 };
 
-async function load(){
-  const r=await fetch("./api/nodes"); 
-  const d=await r.json(); 
-  nodes=d.nodes||[]; 
-  state=d.state||{}; 
-  
-  stableSortNodes();
-  updateCountryFilter();
-  render();
+function setPageLoading(text, percent, step) {
+  const box = $("page_loading");
+  const desc = $("page_loading_desc");
+  const bar = $("page_loading_bar");
+  const pct = $("page_loading_percent");
+  const stepEl = $("page_loading_step");
+  if (!box || !desc || !bar || !pct || !stepEl) return;
+  box.style.display = "flex";
+  desc.textContent = text;
+  bar.style.width = `${percent}%`;
+  pct.textContent = `${percent}%`;
+  stepEl.textContent = step || "加载中";
+}
 
-  if (state.is_connecting) {
-    startConnectionPolling();
+function hidePageLoading() {
+  const box = $("page_loading");
+  if (box) box.style.display = "none";
+}
+
+async function load(){
+  setPageLoading("正在连接后端服务...", 20, "连接服务");
+  try {
+    const r=await fetch("./api/nodes");
+    setPageLoading("正在读取节点池和系统状态...", 55, "读取数据");
+    const d=await r.json();
+    nodes=d.nodes||[];
+    state=d.state||{};
+    setPageLoading("正在渲染控制面板...", 82, "渲染页面");
+    stableSortNodes();
+    updateCountryFilter();
+    render();
+
+    if (state.is_connecting) {
+      setPageLoading("后端正在连接节点，面板将持续刷新状态...", 95, "连接节点");
+      startConnectionPolling();
+    } else {
+      setPageLoading("加载完成", 100, "完成");
+    }
+    setTimeout(hidePageLoading, 350);
+  } catch (e) {
+    setPageLoading("面板加载失败：无法连接后端接口。请稍后刷新，或使用 en logs 查看服务日志。", 100, "加载失败");
+    console.error(e);
   }
 }
 

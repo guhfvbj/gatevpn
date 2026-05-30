@@ -37,7 +37,7 @@ fi
 
 ARCH_NAME="$(uname -m 2>/dev/null || echo unknown)"
 say "${BLUE}==========================================================${PLAIN}"
-say "${BLUE}        欢迎使用 eianun 二改版本 一键源码部署与管理脚本${PLAIN}"
+say "${BLUE}        欢迎使用 Eianun免费聚合落地IP 一键源码部署与管理脚本${PLAIN}"
 say "${BLUE}==========================================================${PLAIN}"
 say "  -> 当前系统: ${GREEN}${OS_NAME}${PLAIN} (${ARCH_NAME})"
 
@@ -212,7 +212,7 @@ configure_service() {
             say "  -> 正在创建 systemd 服务: ${SERVICE_FILE}"
             cat > "$SERVICE_FILE" <<EOF_SERVICE
 [Unit]
-Description=eianun 二改版本 OpenVPN Manager with HTTP/SOCKS5 Proxy
+Description=Eianun免费聚合落地IP OpenVPN Manager with HTTP/SOCKS5 Proxy
 After=network.target
 
 [Service]
@@ -234,8 +234,8 @@ EOF_SERVICE
             say "  -> 正在创建 OpenRC 服务: ${SERVICE_FILE}"
             cat > "$SERVICE_FILE" <<EOF_SERVICE
 #!/sbin/openrc-run
-name="eianun 二改版本"
-description="eianun 二改版本 OpenVPN Manager with HTTP/SOCKS5 Proxy"
+name="Eianun免费聚合落地IP"
+description="Eianun免费聚合落地IP OpenVPN Manager with HTTP/SOCKS5 Proxy"
 directory="${INSTALL_DIR}"
 command="${PYTHON_BIN}"
 command_args="vpngate_manager.py"
@@ -276,9 +276,9 @@ EOF_SERVICE
 
 configure_service
 
-say "\n${YELLOW}[4/4] 正在创建全局命令快捷接口 'eianun'...${PLAIN}"
-say "  -> 正在写入管理脚本 /usr/bin/eianun ..."
-cat > /usr/bin/eianun <<'EOF'
+say "\n${YELLOW}[4/4] 正在创建全局命令快捷接口 'en'...${PLAIN}"
+say "  -> 正在写入管理脚本 /usr/bin/en ..."
+cat > /usr/bin/en <<'EOF'
 #!/usr/bin/env python3
 import sys
 import os
@@ -540,7 +540,7 @@ def print_status():
         openvpn_status = f"{green}[已连接]{reset}" if openvpn_ok else f"{red}[未连接]{reset}"
     
     print_line("=======================================================")
-    print_line(f"               {bold}eianun 二改版本 管理终端 v2.0{reset}                  ")
+    print_line(f"               {bold}Eianun免费聚合落地IP 管理终端 v2.0{reset}                  ")
     print_line("=======================================================")
     print_line("【核心服务状态】")
     print_line(format_line("代理网关 (Port 7928)", gateway_status))
@@ -581,25 +581,25 @@ def print_status():
     print_line("=======================================================")
 
 def start_service():
-    print("正在启动 eianun 二改版本 服务...", flush=True)
+    print("正在启动 Eianun免费聚合落地IP 服务...", flush=True)
     run_service_action("start")
     print("已发送启动指令。")
     time.sleep(1)
 
 def stop_service():
-    print("正在停止 eianun 二改版本 服务...", flush=True)
+    print("正在停止 Eianun免费聚合落地IP 服务...", flush=True)
     run_service_action("stop")
     print("已发送停止指令。")
     time.sleep(1)
 
 def restart_service():
-    print("正在重启 eianun 二改版本 服务...", flush=True)
+    print("正在重启 Eianun免费聚合落地IP 服务...", flush=True)
     run_service_action("restart")
     print("已发送重启指令。")
     time.sleep(1)
 
 def show_logs():
-    print("正在查看 eianun 二改版本 日志 (按 Ctrl+C 退出)...", flush=True)
+    print("正在查看 Eianun免费聚合落地IP 日志 (按 Ctrl+C 退出)...", flush=True)
     mgr = detect_service_manager()
     try:
         if mgr == "systemd" and command_exists("journalctl"):
@@ -676,9 +676,9 @@ def update_service():
         time.sleep(2)
 
 def uninstall_service():
-    confirm = input("确定要完全卸载 eianun 二改版本 吗？(y/N): ")
+    confirm = input("确定要完全卸载 Eianun免费聚合落地IP 吗？(y/N): ")
     if confirm.lower() == 'y':
-        print("正在完全卸载 eianun 二改版本...", flush=True)
+        print("正在完全卸载 Eianun免费聚合落地IP...", flush=True)
         mgr = detect_service_manager()
         if mgr == "systemd":
             subprocess.run(["systemctl", "stop", SYSTEMD_SERVICE])
@@ -704,13 +704,13 @@ def uninstall_service():
                 except Exception:
                     pass
             subprocess.run(["rm", "-rf", "/etc/sv/eianun-vpngate"])
-        for p in ["/usr/bin/eianun", "/usr/bin/ml"]:
+        for p in ["/usr/bin/en", "/usr/bin/eianun", "/usr/bin/ml"]:
             try:
                 os.unlink(p)
             except Exception:
                 pass
         subprocess.run(["rm", "-rf", INSTALL_DIR])
-        print("eianun 二改版本 已卸载！")
+        print("Eianun免费聚合落地IP 已卸载！")
         sys.exit(0)
     else:
         print("已取消卸载。")
@@ -719,7 +719,7 @@ def uninstall_service():
 def ask_restart():
     ans = input("配置已保存。是否立即重启服务生效？(Y/n): ").strip().lower()
     if ans in ('', 'y', 'yes'):
-        print("正在重启 eianun 二改版本 服务...", flush=True)
+        print("正在重启 Eianun免费聚合落地IP 服务...", flush=True)
         run_service_action("restart")
         print("服务已重启。")
         time.sleep(1.5)
@@ -966,16 +966,16 @@ def main():
         sys.exit(0)
         
     options = {
-        '1': ("启动服务 (eianun start)", start_service),
-        '2': ("停止服务 (eianun stop)", stop_service),
-        '3': ("重启服务 (eianun restart)", restart_service),
-        '4': ("日志监控 (eianun logs)", show_logs),
-        '5': ("网页配置 (eianun web)", configure_web),
-        '6': ("端口配置 (eianun port)", configure_port),
-        '7': ("账号密码 (eianun password)", configure_credentials),
-        '8': ("地区过滤 (eianun country)", configure_country),
-        '9': ("一键更新 (eianun update)", update_service),
-        'a': ("完全卸载 (eianun uninstall)", uninstall_service),
+        '1': ("启动服务 (en start)", start_service),
+        '2': ("停止服务 (en stop)", stop_service),
+        '3': ("重启服务 (en restart)", restart_service),
+        '4': ("日志监控 (en logs)", show_logs),
+        '5': ("网页配置 (en web)", configure_web),
+        '6': ("端口配置 (en port)", configure_port),
+        '7': ("账号密码 (en password)", configure_credentials),
+        '8': ("地区过滤 (en country)", configure_country),
+        '9': ("一键更新 (en update)", update_service),
+        'a': ("完全卸载 (en uninstall)", uninstall_service),
         '0': ("退出终端", None)
     }
     
@@ -1051,76 +1051,109 @@ def main():
 if __name__ == "__main__":
     main()
 EOF
-chmod +x /usr/bin/eianun
-ln -sf /usr/bin/eianun /usr/bin/ml
+chmod +x /usr/bin/en
+ln -sf /usr/bin/en /usr/bin/eianun
+rm -f /usr/bin/ml
 
 AUTH_FILE="${INSTALL_DIR}/vpngate_data/ui_auth.json"
 mkdir -p "${INSTALL_DIR}/vpngate_data"
-if [ ! -f "$AUTH_FILE" ]; then
-    say "\n${YELLOW}检测到是首次安装，是否需要自定义配置网页端参数（端口/安全后缀/登录账号密码/拉取地区）？${PLAIN}"
-    ask "是否自定义配置？[y/N]: "
-    is_custom="$REPLY_VALUE"
-    UI_PORT=8787
-    SECRET_PATH="$(${PYTHON_BIN} -c "import random,string; print(''.join(random.choices(string.ascii_letters + string.digits, k=12)))")"
-    UI_PASSWORD="$(${PYTHON_BIN} -c "import random,string
-chars=string.ascii_letters+string.digits
-while True:
- p=''.join(random.choices(chars,k=12))
- if any(c.islower() for c in p) and any(c.isupper() for c in p) and any(c.isdigit() for c in p): print(p); break")"
-    UI_USERNAME="$(${PYTHON_BIN} -c "import random,string
-chars=string.ascii_letters+string.digits
-while True:
- u=''.join(random.choices(chars,k=12))
- if u[0].isalpha() and any(c.islower() for c in u) and any(c.isupper() for c in u) and any(c.isdigit() for c in u): print(u); break")"
-    TARGET_COUNTRIES_INPUT=""
 
-    case "$is_custom" in
-        y|Y)
-            while :; do
-                ask "请输入自定义管理端口 [1-65535, 默认 8787]: "
-                input_port="$REPLY_VALUE"
-                if [ -z "$input_port" ]; then UI_PORT=8787; break; fi
-                case "$input_port" in
-                    *[!0-9]*|'') say "${RED}输入错误: 端口必须是 1 到 65535 之间的数字！${PLAIN}" ;;
-                    *) if [ "$input_port" -ge 1 ] && [ "$input_port" -le 65535 ]; then UI_PORT="$input_port"; break; else say "${RED}输入错误: 端口必须是 1 到 65535 之间的数字！${PLAIN}"; fi ;;
-                esac
-            done
-            while :; do
-                ask "请输入网页登录自定义安全后缀 [字母与数字组合, 默认随机]: "
-                input_suffix="$REPLY_VALUE"
-                if [ -z "$input_suffix" ]; then break; fi
-                case "$input_suffix" in
-                    *[!A-Za-z0-9]* ) say "${RED}输入错误: 后缀仅能由英文字母和数字组成！${PLAIN}" ;;
-                    * ) SECRET_PATH="$input_suffix"; break ;;
-                esac
-            done
-            ask "请输入登录账号 [默认 $UI_USERNAME]: "
-            input_user="$REPLY_VALUE"
-            if [ -n "$input_user" ]; then UI_USERNAME="$input_user"; fi
-            while :; do
-                ask "请输入登录密码 [默认随机生成, 建议包含字母、数字与符号]: "
-                input_pass="$REPLY_VALUE"
-                if [ -z "$input_pass" ]; then break; fi
-                if [ ${#input_pass} -ge 4 ]; then UI_PASSWORD="$input_pass"; break; else say "${RED}输入错误: 密码长度不能少于 4 位！${PLAIN}"; fi
-            done
-            ask "请输入节点拉取地区 [留空=全部地区，例如 JP,日本,US]: "
-            TARGET_COUNTRIES_INPUT="$REPLY_VALUE"
-            ;;
-    esac
-    TARGET_COUNTRIES_INPUT="${TARGET_COUNTRIES_INPUT:-}"
-    ${PYTHON_BIN} -c "
+# 每次安装/更新都允许自定义面板参数；选择否则保留已有配置或生成默认配置。
+UI_PORT="$(${PYTHON_BIN} -c "import json,sys; p='$AUTH_FILE';
+try:
+ d=json.load(open(p,encoding='utf-8')); print(d.get('port',8787))
+except Exception: print(8787)" 2>/dev/null || echo 8787)"
+SECRET_PATH="$(${PYTHON_BIN} -c "import json,sys,random,string; p='$AUTH_FILE';
+try:
+ d=json.load(open(p,encoding='utf-8')); v=d.get('secret_path') or ''; print(v if v else ''.join(random.choices(string.ascii_letters+string.digits,k=12)))
+except Exception: print(''.join(random.choices(string.ascii_letters+string.digits,k=12)))" 2>/dev/null)"
+UI_USERNAME="$(${PYTHON_BIN} -c "import json,random,string; p='$AUTH_FILE'
+def gen():
+ chars=string.ascii_letters+string.digits
+ while True:
+  u=''.join(random.choices(chars,k=12))
+  if u[0].isalpha() and any(c.islower() for c in u) and any(c.isupper() for c in u) and any(c.isdigit() for c in u): return u
+try:
+ d=json.load(open(p,encoding='utf-8')); print(d.get('username') or gen())
+except Exception: print(gen())" 2>/dev/null)"
+UI_PASSWORD="$(${PYTHON_BIN} -c "import json,random,string; p='$AUTH_FILE'
+def gen():
+ chars=string.ascii_letters+string.digits
+ while True:
+  p=''.join(random.choices(chars,k=12))
+  if any(c.islower() for c in p) and any(c.isupper() for c in p) and any(c.isdigit() for c in p): return p
+try:
+ d=json.load(open(p,encoding='utf-8')); print(d.get('password') or gen())
+except Exception: print(gen())" 2>/dev/null)"
+TARGET_COUNTRIES_INPUT="$(${PYTHON_BIN} -c "import json; p='$AUTH_FILE'
+try:
+ d=json.load(open(p,encoding='utf-8')); print(d.get('target_countries',''))
+except Exception: print('')" 2>/dev/null || echo '')"
+NEED_WRITE=0
+[ ! -f "$AUTH_FILE" ] && NEED_WRITE=1
+
+say "
+${YELLOW}是否需要自定义配置网页面板参数？${PLAIN}"
+say "  -> 当前端口: ${GREEN}${UI_PORT}${PLAIN}"
+say "  -> 当前账号: ${GREEN}${UI_USERNAME}${PLAIN}"
+say "  -> 当前安全后缀: ${GREEN}${SECRET_PATH}${PLAIN}"
+say "  -> 当前拉取地区: ${GREEN}${TARGET_COUNTRIES_INPUT:-全部地区}${PLAIN}"
+ask "是否现在配置端口/安全后缀/登录账号密码/拉取地区？[y/N]: "
+is_custom="$REPLY_VALUE"
+
+case "$is_custom" in
+    y|Y)
+        NEED_WRITE=1
+        while :; do
+            ask "请输入自定义管理端口 [1-65535, 默认 ${UI_PORT}]: "
+            input_port="$REPLY_VALUE"
+            if [ -z "$input_port" ]; then break; fi
+            case "$input_port" in
+                *[!0-9]*|'') say "${RED}输入错误: 端口必须是 1 到 65535 之间的数字！${PLAIN}" ;;
+                *) if [ "$input_port" -ge 1 ] && [ "$input_port" -le 65535 ]; then UI_PORT="$input_port"; break; else say "${RED}输入错误: 端口必须是 1 到 65535 之间的数字！${PLAIN}"; fi ;;
+            esac
+        done
+        while :; do
+            ask "请输入网页登录自定义安全后缀 [字母与数字组合, 默认 ${SECRET_PATH}]: "
+            input_suffix="$REPLY_VALUE"
+            if [ -z "$input_suffix" ]; then break; fi
+            case "$input_suffix" in
+                *[!A-Za-z0-9]* ) say "${RED}输入错误: 后缀仅能由英文字母和数字组成！${PLAIN}" ;;
+                * ) SECRET_PATH="$input_suffix"; break ;;
+            esac
+        done
+        ask "请输入登录账号 [默认 ${UI_USERNAME}]: "
+        input_user="$REPLY_VALUE"
+        if [ -n "$input_user" ]; then UI_USERNAME="$input_user"; fi
+        while :; do
+            ask "请输入登录密码 [默认保留当前/随机密码，至少4位]: "
+            input_pass="$REPLY_VALUE"
+            if [ -z "$input_pass" ]; then break; fi
+            if [ ${#input_pass} -ge 4 ]; then UI_PASSWORD="$input_pass"; break; else say "${RED}输入错误: 密码长度不能少于 4 位！${PLAIN}"; fi
+        done
+        ask "请输入节点拉取地区 [留空=全部地区，例如 JP,日本,US]: "
+        TARGET_COUNTRIES_INPUT="$REPLY_VALUE"
+        ;;
+esac
+
+if [ "$NEED_WRITE" = "1" ]; then
+    AUTH_FILE="$AUTH_FILE" UI_PORT="$UI_PORT" SECRET_PATH="$SECRET_PATH" UI_USERNAME="$UI_USERNAME" UI_PASSWORD="$UI_PASSWORD" TARGET_COUNTRIES_INPUT="$TARGET_COUNTRIES_INPUT" ${PYTHON_BIN} - <<'PY_SAVE_AUTH'
 import json
+import os
 cfg = {
     'host': '0.0.0.0',
-    'port': int('$UI_PORT'),
-    'secret_path': '$SECRET_PATH',
-    'username': '$UI_USERNAME',
-    'password': '$UI_PASSWORD',
-    'target_countries': '$TARGET_COUNTRIES_INPUT'
+    'port': int(os.environ.get('UI_PORT') or 8787),
+    'secret_path': os.environ.get('SECRET_PATH') or 'EJsW2EeBo9lY',
+    'username': os.environ.get('UI_USERNAME') or 'admin',
+    'password': os.environ.get('UI_PASSWORD') or 'admin',
+    'target_countries': os.environ.get('TARGET_COUNTRIES_INPUT') or '',
 }
-with open('$AUTH_FILE', 'w', encoding='utf-8') as f:
+with open(os.environ['AUTH_FILE'], 'w', encoding='utf-8') as f:
     json.dump(cfg, f, ensure_ascii=False, indent=2)
-"
+PY_SAVE_AUTH
+    say "${GREEN}面板配置已保存。${PLAIN}"
+else
+    say "${GREEN}已保留现有面板配置。${PLAIN}"
 fi
 
 restart_registered_service() {
@@ -1132,10 +1165,10 @@ restart_registered_service() {
     esac
 }
 
-say "\n正在启动 eianun 二改版本 服务并初始化网络..."
+say "\n正在启动 Eianun免费聚合落地IP 服务并初始化网络..."
 restart_registered_service
 
-say "\n正在等待 eianun 二改版本 首次获取节点并建立加密通道 (此过程可能需要 5-30 秒)..."
+say "\n正在等待 Eianun免费聚合落地IP 首次获取节点并建立加密通道 (此过程可能需要 5-30 秒)..."
 ACTIVE_ID=""
 LAST_MSG=""
 i=1
@@ -1179,16 +1212,16 @@ PUBLIC_IP="$(curl -s --max-time 3 https://api.ipify.org || curl -s --max-time 3 
 printf '%s' "$PUBLIC_IP" > "${INSTALL_DIR}/vpngate_data/public_ip.txt"
 
 say "\n${GREEN}==========================================================${PLAIN}"
-say "${GREEN}             eianun 二改版本 源码一键部署已完成！${PLAIN}"
+say "${GREEN}             Eianun免费聚合落地IP 源码一键部署已完成！${PLAIN}"
 say "${GREEN}==========================================================${PLAIN}"
 say "  * 网页控制面板:  ${BLUE}http://${PUBLIC_IP}:${UI_PORT}/${SECRET_PATH}/${PLAIN}"
 say "  * 网页管理账号:  ${YELLOW}${USERNAME}${PLAIN}"
 say "  * 网页管理密码:  ${YELLOW}${PASSWORD}${PLAIN}"
 say "  * HTTP/SOCKS5 代理端口:  ${BLUE}http://127.0.0.1:7928/${PLAIN}"
 say " --------------------------------------------------------"
-say "  * 快速状态指令:   ${YELLOW}eianun status${PLAIN}  或兼容别名  ${YELLOW}ml${PLAIN}"
-say "  * 查看实时日志:   ${YELLOW}eianun logs${PLAIN}"
-say "  * 停止服务:       ${YELLOW}eianun stop${PLAIN}"
-say "  * 重启服务:       ${YELLOW}eianun restart${PLAIN}"
-say "  * 设置拉取地区:   ${YELLOW}eianun country${PLAIN}"
+say "  * 快速状态指令:   ${YELLOW}en status${PLAIN}  兼容旧命令  ${YELLOW}eianun${PLAIN}"
+say "  * 查看实时日志:   ${YELLOW}en logs${PLAIN}"
+say "  * 停止服务:       ${YELLOW}en stop${PLAIN}"
+say "  * 重启服务:       ${YELLOW}en restart${PLAIN}"
+say "  * 设置拉取地区:   ${YELLOW}en country${PLAIN}"
 say "=========================================================="
