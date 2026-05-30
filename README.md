@@ -9,25 +9,21 @@
 - 新增后端节点地区过滤：可只保留指定国家/地区的 VPNGate 节点，不再默认把全部地区节点都写入节点池。
 - Web 管理后台“管理员设置”新增 **拉取地区过滤** 输入框。
 - 安装后的命令行工具改为 `eianun`，同时保留 `ml` 兼容别名。
-- 安装脚本已适配主流 Linux 包管理器：APT、DNF、YUM、Pacman、Zypper、APK、Emerge、XBPS。
-- 新增 Alpine Linux / OpenRC 与 runit 服务管理适配。
+- 安装脚本已适配主流 Linux 包管理器：APT、DNF、YUM、Pacman、Zypper。
 
 ## 支持系统
 
-脚本会自动识别 `/etc/os-release`、系统包管理器和服务管理器，并安装不同发行版对应的依赖包。
+脚本会自动识别 `/etc/os-release` 和系统包管理器，并安装不同发行版对应的依赖包。
 
-| 系统类型 | 包管理器 | 服务管理器 |
-|---|---|---|
-| Debian / Ubuntu / Linux Mint | apt | systemd |
-| CentOS / RHEL / Rocky / AlmaLinux / Oracle Linux | yum / dnf | systemd |
-| Fedora | dnf | systemd |
-| Arch Linux / Manjaro | pacman | systemd |
-| openSUSE / SUSE | zypper | systemd |
-| Alpine Linux | apk | OpenRC |
-| Gentoo | emerge | OpenRC / systemd |
-| Void Linux | xbps | runit |
+已做适配的发行版族：
 
-说明：脚本已尽量覆盖主流 Linux 发行版，但“全部 Linux”包含大量极简镜像、容器镜像、裁剪内核、非标准服务管理器或没有 TUN/OpenVPN 能力的环境。遇到这类系统时，脚本会明确提示缺失项，而不是静默失败。
+- Debian / Ubuntu / Linux Mint 等 APT 系。
+- CentOS / RHEL / Rocky Linux / AlmaLinux / Oracle Linux 等 YUM 或 DNF 系。
+- Fedora 等 DNF 系。
+- Arch Linux / Manjaro 等 Pacman 系。
+- openSUSE / SUSE 等 Zypper 系。
+
+注意：本项目仍依赖 **systemd** 管理后台服务。如果系统没有 `systemctl`，安装脚本会直接提示不支持。
 
 ## 快速安装
 
@@ -36,7 +32,8 @@
 上传文件到该仓库后，使用下面命令安装：
 
 ```bash
-curl -Ls https://raw.githubusercontent.com/illria/gatevpn/main/install.sh | sudo sh
+curl -Ls https://raw.githubusercontent.com/illria/gatevpn/main/install.sh -o install.sh
+sudo sh install.sh
 ```
 
 Alpine Linux 也可以直接使用上面的 `sh` 命令；脚本会通过 `apk` 自动安装 OpenVPN、OpenRC、Python 等依赖。
@@ -44,7 +41,7 @@ Alpine Linux 也可以直接使用上面的 `sh` 命令；脚本会通过 `apk` 
 也可以在安装时指定仓库用户和仓库名：
 
 ```bash
-sh install.sh illria gatevpn
+bash install.sh illria gatevpn
 ```
 
 ## 安装脚本依赖检测
@@ -52,14 +49,12 @@ sh install.sh illria gatevpn
 安装脚本会自动执行：
 
 1. 检测 root 权限。
-2. 检测包管理器：`apt-get`、`dnf`、`yum`、`pacman`、`zypper`、`apk`、`emerge`、`xbps-install`。
-3. 根据发行版安装依赖：`openvpn`、`curl`、`git`、`ca-certificates`、`iptables`、`iproute/iproute2`、`procps/procps-ng`、`psmisc`、`python3/python`、`iputils/iputils-ping`。
-4. 检测服务管理器：`systemd`、`OpenRC`、`runit`。
-5. 安装后再次检测必要工具：`openvpn`、`curl`、`git`、`ip`、`ping`、`iptables`、`pkill`、`Python` 以及对应服务管理命令。
+2. 检测 systemd / `systemctl`。
+3. 检测包管理器：`apt-get`、`dnf`、`yum`、`pacman`、`zypper`。
+4. 根据发行版安装依赖：`openvpn`、`curl`、`git`、`ca-certificates`、`iptables`、`iproute/iproute2`、`procps/procps-ng`、`psmisc`、`python3/python`、`iputils/iputils-ping`。
+5. 安装后再次检测必要工具：`openvpn`、`curl`、`git`、`systemctl`、`ip`、`ping`、`iptables`、`pkill`、`Python`。
 
 RHEL / CentOS / Rocky / AlmaLinux 等系统会尝试自动安装 `epel-release`，方便安装 OpenVPN。如果你的镜像源没有 EPEL，需要先手动启用 EPEL。
-
-Alpine Linux 会通过 `apk` 安装 `openrc` 并注册 `/etc/init.d/eianun-vpngate` 服务。
 
 ## 指定地区拉取节点
 
@@ -127,3 +122,20 @@ eianun uninstall   # 卸载
 - `proxy_server.py`：本地 HTTP/SOCKS5 代理服务。
 - `install.sh`：一键安装和 CLI 工具生成脚本。
 - `LICENSE`：原始许可证文件。
+
+
+### ✅ 已适配的 Linux 发行版 / 包管理器
+
+安装脚本会自动识别并安装依赖：
+
+| 系统类型 | 包管理器 | 服务管理器 |
+|---|---|---|
+| Debian / Ubuntu / Linux Mint | apt | systemd |
+| CentOS / RHEL / AlmaLinux / Rocky / Fedora | yum / dnf | systemd |
+| Arch / Manjaro | pacman | systemd |
+| openSUSE / SUSE | zypper | systemd |
+| Alpine Linux | apk | OpenRC |
+| Gentoo | emerge | OpenRC / systemd |
+| Void Linux | xbps | runit |
+
+说明：脚本尽量覆盖主流 Linux，但“全部 Linux”里存在大量极简镜像、容器镜像、非标准服务管理器或缺少 TUN/OpenVPN 内核能力的环境。遇到这类系统时，脚本会提示缺失项，而不是静默失败。

@@ -9,7 +9,15 @@ BLUE='\033[0;36m'
 PLAIN='\033[0m'
 
 say() { printf '%b\n' "$*"; }
-ask() { printf '%b' "$1"; IFS= read -r REPLY_VALUE || REPLY_VALUE=""; }
+ask() {
+    printf '%b' "$1"
+    if [ -r /dev/tty ]; then
+        IFS= read -r REPLY_VALUE </dev/tty || REPLY_VALUE=""
+    else
+        REPLY_VALUE=""
+        printf '\n'
+    fi
+}
 
 if [ "$(id -u)" != "0" ]; then
     say "${RED}错误: 必须以 root 权限运行此脚本。请使用 root/sudo 运行。${PLAIN}"
