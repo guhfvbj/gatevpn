@@ -2984,17 +2984,21 @@ function render(){
       const testBtnText = isTesting ? `${testSpinner}检测中` : '检测';
       const testBtn = `<button class="test-btn" data-node-id="${esc(n.id)}" ${isTesting ? 'disabled' : ''} onclick="testNode(this, '${esc(n.id)}', event)">${testBtnText}</button>`;
       
-      // Only clean, tested nodes are allowed to connect by default.
+      // Always keep the manual switch button visible.
+      // If the node has not been tested, clicking "切换" will guide the user to run detection first.
       const isUnavailable = n.probe_status === "unavailable";
-      const isUnknown = n.probe_status !== "available";
+      const riskSources = Array.isArray(n.risk_sources) ? n.risk_sources : [];
+      const riskLevel = String(n.risk_level || "unknown").toLowerCase();
+      const isUnknown = n.probe_status !== "available" || riskLevel === "unknown" || riskSources.length === 0;
       const cleanOk = isCleanNode(n);
-      let blockReason = "";
-      if (isUnknown) blockReason = "请先检测节点，通过 OpenVPN 握手和 IP 风控后才能切换";
-      else if (!cleanOk) blockReason = `IP 风控未通过：${translateRiskLevel(n.risk_level)}，欺诈值 ${n.fraud_score ?? "未知"}，黑名单 ${n.blacklist_count || 0}`;
-      const disableConnect = isUnavailable || isUnknown || state.is_connecting || !cleanOk;
+      let switchTitle = "切换到该节点";
+      if (state.is_connecting) switchTitle = "当前正在连接其它节点，请稍候";
+      else if (isUnavailable) switchTitle = "该节点当前检测为不可用，可先重新检测";
+      else if (isUnknown) switchTitle = "该节点尚未完成可用性和 IP 风控检测，点击后可先检测再切换";
+      else if (!cleanOk) switchTitle = `IP 风控未通过：${translateRiskLevel(n.risk_level)}，欺诈值 ${n.fraud_score ?? "未知"}，黑名单 ${n.blacklist_count || 0}`;
       const connectBtn = isCurrentlyActive 
         ? `<button class="connect-btn" disabled style="background: var(--success-gradient); color: white; cursor: default; opacity: 1;">已连接</button>`
-        : `<button class="connect-btn" ${disableConnect ? `disabled title="${esc(blockReason || "当前不可切换")}" style="opacity:0.3; cursor:not-allowed;"` : ''} onclick="connectNode('${esc(n.id)}')">${cleanOk ? "切换" : "需检测"}</button>`;
+        : `<button class="connect-btn" title="${esc(switchTitle)}" ${state.is_connecting ? 'disabled style="opacity:0.45; cursor:not-allowed;"' : ''} onclick="handleSwitchClick('${esc(n.id)}')">切换</button>`;
       
       return `<tr ${rowClass}>
         <td><span class="badge ${badgeClass}">${badgeText}</span></td>
@@ -3045,10 +3049,12 @@ $("btn_last_page").onclick = () => {
   render();
 };
 
-async function testNode(btn, id, event){
+async function testNode(btn, id, event, options){
   if (event) event.stopPropagation();
+  const opts = options || {};
   testingNodeIds.add(id);
   render();
+  let updatedNode = null;
   
   try {
     const response = await fetch("./api/test_node", {
@@ -3062,12 +3068,64 @@ async function testNode(btn, id, event){
       if (idx !== -1) {
         nodes[idx] = result.node;
       }
+      updatedNode = result.node;
+    } else if (!opts.quiet) {
+      alert("检测失败: " + (result.error || "未知错误"));
     }
   } catch (e) {
+    if (!opts.quiet) alert("检测请求失败，请稍后重试");
   } finally {
     testingNodeIds.delete(id);
     render();
   }
+  return updatedNode || nodes.find(n => n.id === id) || null;
+}
+
+function switchBlockReason(n) {
+  if (!n) return "节点不存在";
+  const riskLevel = String(n.risk_level || "unknown").toLowerCase();
+  const riskSources = Array.isArray(n.risk_sources) ? n.risk_sources : [];
+  if (n.probe_status !== "available") return "该节点还没有通过 OpenVPN 可用性检测";
+  if (riskLevel === "unknown" || riskSources.length === 0) return "该节点还没有完成 IP 风控检测";
+  if (Number(n.blacklist_count || 0) > 0) return `黑名单命中 ${n.blacklist_count || 0} 个: ${(n.blacklist_hits || []).join(", ")}`;
+  if (Number(n.fraud_score ?? 100) > Number(state.max_auto_fraud_score ?? 25)) return `欺诈值 ${n.fraud_score ?? "未知"} 高于阈值 ${state.max_auto_fraud_score ?? 25}`;
+  if (["medium", "high", "blocked"].includes(riskLevel)) return `风险等级为 ${translateRiskLevel(riskLevel)}`;
+  if (["proxy", "hosting", "tor"].includes(String(n.ip_type || "").toLowerCase())) return `IP 类型为 ${translateIpType(n.ip_type)}，默认不自动切换`;
+  return "";
+}
+
+async function handleSwitchClick(id) {
+  if (state.is_connecting) return;
+  let n = nodes.find(item => item.id === id);
+  if (!n) {
+    alert("节点不存在或列表已刷新，请重新加载后再试");
+    return;
+  }
+  if (n.active || n.id === state.active_openvpn_node_id) return;
+
+  const riskLevel = String(n.risk_level || "unknown").toLowerCase();
+  const riskSources = Array.isArray(n.risk_sources) ? n.risk_sources : [];
+  const needDetect = n.probe_status !== "available" || riskLevel === "unknown" || riskSources.length === 0;
+
+  if (n.probe_status === "unavailable") {
+    const retry = confirm("该节点当前检测为不可用。是否重新检测一次？检测通过后会继续判断 IP 风控。\n\n节点: " + (n.ip || n.remote_host));
+    if (!retry) return;
+  } else if (needDetect) {
+    const ok = confirm("该节点还没有完成可用性和 IP 风控检测。\n\n是否先检测该节点？检测通过且 IP 干净后会自动切换。");
+    if (!ok) return;
+  }
+
+  if (needDetect || n.probe_status === "unavailable") {
+    n = await testNode(null, id, null, {quiet: false});
+    if (!n) return;
+  }
+
+  if (!isCleanNode(n)) {
+    alert("该节点暂不建议切换：\n" + switchBlockReason(n) + "\n\n你也可以重新检测，或在服务器环境变量中调整 MAX_AUTO_FRAUD_SCORE / ALLOW_RISKY_IP_CONNECT。");
+    return;
+  }
+
+  connectNode(id);
 }
 
 let pollInterval = null;
