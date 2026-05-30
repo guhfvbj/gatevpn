@@ -1407,11 +1407,26 @@ LOGIN_HTML = r"""<!DOCTYPE html>
         const response = await fetch("./api/login", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ username: uname, password: pwd })
+          body: JSON.stringify({ username: uname, password: pwd }),
+          cache: "no-store"
         });
         setLoginProgress("2/3 正在建立管理会话...", 58);
         
-        const data = await response.json();
+        let data;
+        try {
+          data = await Promise.race([
+            response.json(),
+            new Promise((_, reject) => setTimeout(() => reject(new Error("login response parse timeout")), 3000))
+          ]);
+        } catch (parseErr) {
+          if (response.ok) {
+            // 兼容少数环境下登录响应正文被代理/浏览器卡住的情况：
+            // 只要 HTTP 状态已经成功，Cookie 已经写入，就直接进入面板。
+            data = { ok: true };
+          } else {
+            throw parseErr;
+          }
+        }
         if (response.ok && data.ok) {
           submitBtn.querySelector("span").textContent = "验证成功";
           setLoginProgress("3/3 登录成功，正在加载面板与节点状态...", 86);
@@ -1419,7 +1434,7 @@ LOGIN_HTML = r"""<!DOCTYPE html>
             setLoginProgress("正在进入控制面板，请稍候...", 100);
           }, 250);
           setTimeout(() => {
-            window.location.reload();
+            window.location.replace(window.location.href.split("#")[0]);
           }, 650);
         } else {
           setLoginProgress("验证失败，请检查账号密码", 100);
@@ -3461,13 +3476,18 @@ class Handler(BaseHTTPRequestHandler):
                     token = uuid.uuid4().hex
                     with lock:
                         active_sessions[token] = time.time() + 30 * 24 * 3600
+                    body = json.dumps({"ok": True}, ensure_ascii=False).encode("utf-8")
                     self.send_response(HTTPStatus.OK)
                     self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Connection", "close")
                     secret_path = self.get_secret_path()
                     cookie_path = f"/{secret_path}/" if secret_path else "/"
                     self.send_header("Set-Cookie", f"session={token}; Path={cookie_path}; HttpOnly; SameSite=Lax; Max-Age=2592000")
                     self.end_headers()
-                    self.wfile.write(json.dumps({"ok": True}).encode("utf-8"))
+                    self.wfile.write(body)
+                    self.close_connection = True
                 else:
                     self.send_json({"ok": False, "error": "用户名或密码不正确，请重新输入"}, HTTPStatus.FORBIDDEN)
             except Exception as exc:
