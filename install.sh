@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 set -e
 export DEBIAN_FRONTEND=noninteractive
 
@@ -8,143 +8,167 @@ YELLOW='\033[0;33m'
 BLUE='\033[0;36m'
 PLAIN='\033[0m'
 
-# 1. Check root permissions
-if [[ "$(id -u)" != "0" ]]; then
-    echo -e "${RED}错误: 必须以 root 权限运行此脚本。请使用: sudo bash $0${PLAIN}"
+say() { printf '%b\n' "$*"; }
+ask() { printf '%b' "$1"; IFS= read -r REPLY_VALUE || REPLY_VALUE=""; }
+
+if [ "$(id -u)" != "0" ]; then
+    say "${RED}错误: 必须以 root 权限运行此脚本。请使用 root/sudo 运行。${PLAIN}"
     exit 1
 fi
 
-# 2. Detect Linux distribution and package manager
 if [ -f /etc/os-release ]; then
     . /etc/os-release
     OS_ID="${ID:-unknown}"
     OS_NAME="${PRETTY_NAME:-$OS_ID}"
+    OS_LIKE="${ID_LIKE:-}"
 else
     OS_ID="unknown"
     OS_NAME="unknown Linux"
+    OS_LIKE=""
 fi
 
 ARCH_NAME="$(uname -m 2>/dev/null || echo unknown)"
-echo -e "${BLUE}==========================================================${PLAIN}"
-echo -e "${BLUE}        欢迎使用 eianun 二改版本 一键源码部署与管理脚本${PLAIN}"
-echo -e "${BLUE}==========================================================${PLAIN}"
-echo -e "  -> 当前系统: ${GREEN}${OS_NAME}${PLAIN} (${ARCH_NAME})"
-
-if ! command -v systemctl >/dev/null 2>&1; then
-    echo -e "${RED}错误: 当前系统未检测到 systemctl。此项目需要 systemd 管理服务。${PLAIN}"
-    exit 1
-fi
+say "${BLUE}==========================================================${PLAIN}"
+say "${BLUE}        欢迎使用 eianun 二改版本 一键源码部署与管理脚本${PLAIN}"
+say "${BLUE}==========================================================${PLAIN}"
+say "  -> 当前系统: ${GREEN}${OS_NAME}${PLAIN} (${ARCH_NAME})"
 
 detect_package_manager() {
-    if command -v apt-get >/dev/null 2>&1; then
-        echo "apt"
-    elif command -v dnf >/dev/null 2>&1; then
-        echo "dnf"
-    elif command -v yum >/dev/null 2>&1; then
-        echo "yum"
-    elif command -v pacman >/dev/null 2>&1; then
-        echo "pacman"
-    elif command -v zypper >/dev/null 2>&1; then
-        echo "zypper"
-    else
-        echo ""
+    if command -v apt-get >/dev/null 2>&1; then echo apt
+    elif command -v dnf >/dev/null 2>&1; then echo dnf
+    elif command -v yum >/dev/null 2>&1; then echo yum
+    elif command -v pacman >/dev/null 2>&1; then echo pacman
+    elif command -v zypper >/dev/null 2>&1; then echo zypper
+    elif command -v apk >/dev/null 2>&1; then echo apk
+    elif command -v emerge >/dev/null 2>&1; then echo emerge
+    elif command -v xbps-install >/dev/null 2>&1; then echo xbps
+    else echo manual
     fi
+}
+
+detect_service_manager() {
+    if command -v systemctl >/dev/null 2>&1; then echo systemd
+    elif command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1; then echo openrc
+    elif command -v sv >/dev/null 2>&1; then echo runit
+    else echo manual
+    fi
+}
+
+is_rhel_like() {
+    case " $OS_ID $OS_LIKE " in
+        *rhel*|*centos*|*fedora*|*rocky*|*almalinux*|*ol*) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 install_base_dependencies() {
     PKG_MANAGER="$(detect_package_manager)"
-    if [ -z "$PKG_MANAGER" ]; then
-        echo -e "${RED}错误: 未检测到支持的包管理器。已支持 apt / dnf / yum / pacman / zypper。${PLAIN}"
-        exit 1
-    fi
-
-    echo -e "\n${YELLOW}[1/4] 正在安装系统基础依赖...${PLAIN}"
-    echo -e "  -> 检测到包管理器: ${GREEN}${PKG_MANAGER}${PLAIN}"
-
+    say "\n${YELLOW}[1/4] 正在安装系统基础依赖...${PLAIN}"
+    say "  -> 检测到包管理器: ${GREEN}${PKG_MANAGER}${PLAIN}"
     case "$PKG_MANAGER" in
         apt)
-            echo -e "  -> 正在更新 APT 软件源..."
+            say "  -> 正在更新 APT 软件源..."
             apt-get update -q || true
-            echo -e "  -> 正在安装依赖: openvpn curl git ca-certificates iptables iproute2 psmisc procps python3 iputils-ping"
+            say "  -> 正在安装依赖: openvpn curl git ca-certificates iptables iproute2 psmisc procps python3 iputils-ping"
             apt-get install -y openvpn curl git ca-certificates iptables iproute2 psmisc procps python3 iputils-ping
             ;;
         dnf)
-            if [[ " ${ID_LIKE:-} ${OS_ID:-} " =~ (rhel|centos|fedora|rocky|almalinux|ol) ]]; then
-                echo -e "  -> RHEL 系发行版尝试启用 EPEL，便于安装 OpenVPN..."
+            if is_rhel_like; then
+                say "  -> RHEL/Fedora 系发行版尝试启用 EPEL，便于安装 OpenVPN..."
                 dnf -y install epel-release || true
             fi
-            echo -e "  -> 正在安装依赖: openvpn curl git ca-certificates iptables iproute procps-ng psmisc python3 iputils"
+            say "  -> 正在安装依赖: openvpn curl git ca-certificates iptables iproute procps-ng psmisc python3 iputils"
             dnf -y install openvpn curl git ca-certificates iptables iproute procps-ng psmisc python3 iputils
             ;;
         yum)
-            if [[ " ${ID_LIKE:-} ${OS_ID:-} " =~ (rhel|centos|rocky|almalinux|ol) ]]; then
-                echo -e "  -> RHEL/CentOS 系发行版尝试启用 EPEL，便于安装 OpenVPN..."
+            if is_rhel_like; then
+                say "  -> RHEL/CentOS 系发行版尝试启用 EPEL，便于安装 OpenVPN..."
                 yum -y install epel-release || true
             fi
-            echo -e "  -> 正在安装依赖: openvpn curl git ca-certificates iptables iproute procps-ng psmisc python3 iputils"
+            say "  -> 正在安装依赖: openvpn curl git ca-certificates iptables iproute procps-ng psmisc python3 iputils"
             yum -y install openvpn curl git ca-certificates iptables iproute procps-ng psmisc python3 iputils
             ;;
         pacman)
-            echo -e "  -> 正在同步并安装依赖: openvpn curl git ca-certificates iptables iproute2 procps-ng psmisc python iputils"
+            say "  -> 正在同步并安装依赖: openvpn curl git ca-certificates iptables iproute2 procps-ng psmisc python iputils"
             pacman -Sy --noconfirm --needed openvpn curl git ca-certificates iptables iproute2 procps-ng psmisc python iputils
             ;;
         zypper)
-            echo -e "  -> 正在刷新 Zypper 软件源..."
+            say "  -> 正在刷新 Zypper 软件源..."
             zypper --non-interactive refresh || true
-            echo -e "  -> 正在安装依赖: openvpn curl git ca-certificates iptables iproute2 procps psmisc python3 iputils"
+            say "  -> 正在安装依赖: openvpn curl git ca-certificates iptables iproute2 procps psmisc python3 iputils"
             zypper --non-interactive install -y openvpn curl git ca-certificates iptables iproute2 procps psmisc python3 iputils
+            ;;
+        apk)
+            say "  -> Alpine Linux 检测通过，正在刷新 APK 索引..."
+            apk update || true
+            say "  -> 正在安装依赖: openvpn curl git ca-certificates iptables iproute2 psmisc procps python3 iputils openrc"
+            apk add --no-cache openvpn curl git ca-certificates iptables iproute2 psmisc procps python3 iputils openrc
+            update-ca-certificates >/dev/null 2>&1 || true
+            ;;
+        emerge)
+            say "  -> Gentoo/Portage 检测通过，正在安装依赖..."
+            emerge --ask=n net-vpn/openvpn net-misc/curl dev-vcs/git app-crypt/ca-certificates net-firewall/iptables sys-apps/iproute2 sys-process/psmisc sys-process/procps net-misc/iputils dev-lang/python || true
+            ;;
+        xbps)
+            say "  -> Void Linux/XBPS 检测通过，正在安装依赖..."
+            xbps-install -Sy openvpn curl git ca-certificates iptables iproute2 psmisc procps-ng python3 iputils runit || true
+            ;;
+        manual)
+            say "${YELLOW}警告: 未检测到 apt/dnf/yum/pacman/zypper/apk/emerge/xbps，跳过自动安装，将直接进行工具检测。${PLAIN}"
             ;;
     esac
 }
 
 check_required_tools() {
     PYTHON_BIN="$(command -v python3 || true)"
+    if [ -z "$PYTHON_BIN" ]; then PYTHON_BIN="$(command -v python || true)"; fi
     if [ -z "$PYTHON_BIN" ]; then
-        PYTHON_BIN="$(command -v python || true)"
+        say "${RED}错误: Python 未安装或不在 PATH 中。${PLAIN}"
+        exit 1
     fi
-    if [ -z "$PYTHON_BIN" ]; then
-        echo -e "${RED}错误: Python 未安装或不在 PATH 中。${PLAIN}"
+
+    SERVICE_MANAGER="$(detect_service_manager)"
+    if [ "$SERVICE_MANAGER" = "manual" ]; then
+        say "${RED}错误: 未检测到 systemd / OpenRC / runit 服务管理器。${PLAIN}"
+        say "${YELLOW}项目可以手动运行，但一键安装需要至少一种服务管理器来注册后台服务。${PLAIN}"
         exit 1
     fi
 
     missing=""
-    for cmd in openvpn curl git systemctl ip ping iptables pkill; do
-        if ! command -v "$cmd" >/dev/null 2>&1; then
-            missing="$missing $cmd"
-        fi
+    for cmd in openvpn curl git ip ping iptables pkill; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then missing="$missing $cmd"; fi
     done
+    case "$SERVICE_MANAGER" in
+        systemd) command -v systemctl >/dev/null 2>&1 || missing="$missing systemctl" ;;
+        openrc) command -v rc-service >/dev/null 2>&1 || missing="$missing rc-service"; command -v rc-update >/dev/null 2>&1 || missing="$missing rc-update" ;;
+        runit) command -v sv >/dev/null 2>&1 || missing="$missing sv" ;;
+    esac
     if [ -n "$missing" ]; then
-        echo -e "${RED}错误: 依赖工具仍缺失:${missing}${PLAIN}"
-        echo -e "${YELLOW}请检查发行版软件源是否可用；RHEL/CentOS/AlmaLinux/Rocky 若缺少 openvpn，请确认 EPEL 已启用。${PLAIN}"
+        say "${RED}错误: 依赖工具仍缺失:${missing}${PLAIN}"
+        say "${YELLOW}请检查发行版软件源是否可用；RHEL/CentOS/Alma/Rocky 若缺少 openvpn，请确认 EPEL 已启用。Alpine 请确认 apk 源可用。${PLAIN}"
         exit 1
     fi
-
-    echo -e "  -> 依赖检测通过: openvpn / curl / git / systemctl / ip / ping / iptables / pkill / Python"
-    echo -e "  -> Python: ${GREEN}${PYTHON_BIN}${PLAIN}"
+    say "  -> 依赖检测通过: openvpn / curl / git / ip / ping / iptables / pkill / Python / ${SERVICE_MANAGER}"
+    say "  -> Python: ${GREEN}${PYTHON_BIN}${PLAIN}"
 }
 
-# 3. Configure GitHub Repository URL
-# Default to your repository (illria/gatevpn)
 DEFAULT_USER="illria"
 DEFAULT_REPO="gatevpn"
-
-# Allow custom repository override via command line arguments
-GITHUB_USER="${1:-${DEFAULT_USER}}"
-GITHUB_REPO="${2:-${DEFAULT_REPO}}"
-
+GITHUB_USER="${1:-$DEFAULT_USER}"
+GITHUB_REPO="${2:-$DEFAULT_REPO}"
 GITHUB_URL="https://github.com/${GITHUB_USER}/${GITHUB_REPO}.git"
+INSTALL_DIR="/opt/eianun-vpngate"
+SERVICE_NAME="eianun-vpngate"
 
 install_base_dependencies
 check_required_tools
 
-# 4. Clone or pull the repository
-INSTALL_DIR="/opt/eianun-vpngate"
-echo -e "\n${YELLOW}[2/4] 正在从 GitHub 部署源代码到 ${INSTALL_DIR}...${PLAIN}"
+say "\n${YELLOW}[2/4] 正在从 GitHub 部署源代码到 ${INSTALL_DIR}...${PLAIN}"
 if [ -f "${INSTALL_DIR}/.local_dev" ]; then
-    echo -e "${GREEN}检测到本地开发模式 (.local_dev)，跳过 git pull/reset 保持本地修改。${PLAIN}"
+    say "${GREEN}检测到本地开发模式 (.local_dev)，跳过 git pull/reset 保持本地修改。${PLAIN}"
 else
     if [ -d "${INSTALL_DIR}" ]; then
-        echo -e "  -> 目录 ${INSTALL_DIR} 已存在，正在更新并强制覆盖本地源码..."
+        say "  -> 目录 ${INSTALL_DIR} 已存在，正在更新并强制覆盖本地源码..."
         cd "${INSTALL_DIR}"
         if git remote get-url origin >/dev/null 2>&1; then
             git remote set-url origin "${GITHUB_URL}" || true
@@ -153,36 +177,32 @@ else
         fi
         git fetch --all || true
         BRANCH="main"
-        if git rev-parse --verify origin/main >/dev/null 2>&1; then
-            BRANCH="main"
-        elif git rev-parse --verify origin/master >/dev/null 2>&1; then
-            BRANCH="master"
-        fi
-        echo -e "  -> 正在强制重置本地源码至 origin/${BRANCH} ..."
+        if git rev-parse --verify origin/main >/dev/null 2>&1; then BRANCH="main"; elif git rev-parse --verify origin/master >/dev/null 2>&1; then BRANCH="master"; fi
+        say "  -> 正在强制重置本地源码至 origin/${BRANCH} ..."
         if git reset --hard "origin/${BRANCH}"; then
-            echo -e "${GREEN}  -> 源码更新成功！${PLAIN}"
+            say "${GREEN}  -> 源码更新成功！${PLAIN}"
         else
-            if git pull; then
-                echo -e "${GREEN}  -> 源码更新成功！${PLAIN}"
-            else
-                echo -e "${YELLOW}  -> 警告: git pull/reset 失败，将保留当前本地源码并继续安装。${PLAIN}"
-            fi
+            if git pull; then say "${GREEN}  -> 源码更新成功！${PLAIN}"; else say "${YELLOW}  -> 警告: git pull/reset 失败，将保留当前本地源码并继续安装。${PLAIN}"; fi
         fi
     else
-        echo -e "  -> 正在克隆 GitHub 仓库 ${GITHUB_URL} ..."
+        say "  -> 正在克隆 GitHub 仓库 ${GITHUB_URL} ..."
         if git clone "${GITHUB_URL}" "${INSTALL_DIR}"; then
-            echo -e "${GREEN}  -> 克隆成功！${PLAIN}"
+            say "${GREEN}  -> 克隆成功！${PLAIN}"
         else
-            echo -e "${RED}  -> 错误: 无法克隆仓库 ${GITHUB_URL}，请检查网络！${PLAIN}"
+            say "${RED}  -> 错误: 无法克隆仓库 ${GITHUB_URL}，请检查网络！${PLAIN}"
             exit 1
         fi
     fi
 fi
 
-# 5. Configure Systemd Service (direct python3 run)
-echo -e "\n${YELLOW}[3/4] 正在配置 systemd 系统服务...${PLAIN}"
-echo -e "  -> 正在创建服务配置 /lib/systemd/system/eianun-vpngate.service ..."
-cat > /lib/systemd/system/eianun-vpngate.service <<EOF
+configure_service() {
+    SERVICE_MANAGER="$(detect_service_manager)"
+    say "\n${YELLOW}[3/4] 正在配置系统服务 (${SERVICE_MANAGER})...${PLAIN}"
+    case "$SERVICE_MANAGER" in
+        systemd)
+            SERVICE_FILE="/etc/systemd/system/eianun-vpngate.service"
+            say "  -> 正在创建 systemd 服务: ${SERVICE_FILE}"
+            cat > "$SERVICE_FILE" <<EOF_SERVICE
 [Unit]
 Description=eianun 二改版本 OpenVPN Manager with HTTP/SOCKS5 Proxy
 After=network.target
@@ -197,15 +217,59 @@ EnvironmentFile=-/etc/default/eianun-vpngate
 
 [Install]
 WantedBy=multi-user.target
-EOF
+EOF_SERVICE
+            systemctl daemon-reload
+            systemctl enable eianun-vpngate.service
+            ;;
+        openrc)
+            SERVICE_FILE="/etc/init.d/eianun-vpngate"
+            say "  -> 正在创建 OpenRC 服务: ${SERVICE_FILE}"
+            cat > "$SERVICE_FILE" <<EOF_SERVICE
+#!/sbin/openrc-run
+name="eianun 二改版本"
+description="eianun 二改版本 OpenVPN Manager with HTTP/SOCKS5 Proxy"
+directory="${INSTALL_DIR}"
+command="${PYTHON_BIN}"
+command_args="vpngate_manager.py"
+command_background="yes"
+pidfile="/run/eianun-vpngate.pid"
+output_log="${INSTALL_DIR}/vpngate_data/vpngate.log"
+error_log="${INSTALL_DIR}/vpngate_data/vpngate.log"
 
-echo -e "  -> 正在重新加载 systemd 系统服务列表并启用开机自启..."
-systemctl daemon-reload
-systemctl enable eianun-vpngate.service
+depend() {
+    need net
+}
 
-# 6. Configure global command shortcut "ml"
-echo -e "\n${YELLOW}[4/4] 正在创建全局命令快捷接口 'eianun'...${PLAIN}"
-echo -e "  -> 正在写入管理脚本 /usr/bin/eianun ..."
+start_pre() {
+    checkpath --directory --mode 0755 "${INSTALL_DIR}/vpngate_data"
+}
+EOF_SERVICE
+            chmod +x "$SERVICE_FILE"
+            rc-update add eianun-vpngate default
+            ;;
+        runit)
+            SERVICE_DIR="/etc/sv/eianun-vpngate"
+            say "  -> 正在创建 runit 服务: ${SERVICE_DIR}"
+            mkdir -p "$SERVICE_DIR" "${INSTALL_DIR}/vpngate_data"
+            cat > "$SERVICE_DIR/run" <<EOF_SERVICE
+#!/bin/sh
+cd "${INSTALL_DIR}" || exit 1
+exec ${PYTHON_BIN} vpngate_manager.py >> "${INSTALL_DIR}/vpngate_data/vpngate.log" 2>&1
+EOF_SERVICE
+            chmod +x "$SERVICE_DIR/run"
+            if [ -d /var/service ]; then ln -sfn "$SERVICE_DIR" /var/service/eianun-vpngate; elif [ -d /etc/service ]; then ln -sfn "$SERVICE_DIR" /etc/service/eianun-vpngate; fi
+            ;;
+        *)
+            say "${RED}错误: 未检测到可用服务管理器，无法注册后台服务。${PLAIN}"
+            exit 1
+            ;;
+    esac
+}
+
+configure_service
+
+say "\n${YELLOW}[4/4] 正在创建全局命令快捷接口 'eianun'...${PLAIN}"
+say "  -> 正在写入管理脚本 /usr/bin/eianun ..."
 cat > /usr/bin/eianun <<'EOF'
 #!/usr/bin/env python3
 import sys
@@ -218,6 +282,39 @@ import termios
 
 INSTALL_DIR = "/opt/eianun-vpngate"
 LOG_FILE = "/opt/eianun-vpngate/vpngate_data/vpngate.log"
+
+SERVICE_NAME = "eianun-vpngate"
+SYSTEMD_SERVICE = SERVICE_NAME + ".service"
+
+def command_exists(name):
+    from shutil import which
+    return which(name) is not None
+
+def detect_service_manager():
+    if command_exists("systemctl"):
+        return "systemd"
+    if command_exists("rc-service"):
+        return "openrc"
+    if command_exists("sv"):
+        return "runit"
+    return "manual"
+
+def run_service_action(action):
+    mgr = detect_service_manager()
+    try:
+        if mgr == "systemd":
+            return subprocess.run(["systemctl", action, SYSTEMD_SERVICE])
+        if mgr == "openrc":
+            return subprocess.run(["rc-service", SERVICE_NAME, action])
+        if mgr == "runit":
+            runit_action = {"start": "up", "stop": "down", "restart": "restart", "status": "status"}.get(action, action)
+            return subprocess.run(["sv", runit_action, SERVICE_NAME])
+        print("未检测到 systemd / OpenRC / runit，请手动管理服务进程。")
+        return None
+    except FileNotFoundError:
+        print("服务管理命令不存在，请检查系统服务管理器。")
+        return None
+
 
 def generate_random_password():
     import random
@@ -477,32 +574,41 @@ def print_status():
 
 def start_service():
     print("正在启动 eianun 二改版本 服务...", flush=True)
-    subprocess.run(["systemctl", "start", "eianun-vpngate.service"])
+    run_service_action("start")
     print("已发送启动指令。")
     time.sleep(1)
 
 def stop_service():
     print("正在停止 eianun 二改版本 服务...", flush=True)
-    subprocess.run(["systemctl", "stop", "eianun-vpngate.service"])
+    run_service_action("stop")
     print("已发送停止指令。")
     time.sleep(1)
 
 def restart_service():
     print("正在重启 eianun 二改版本 服务...", flush=True)
-    subprocess.run(["systemctl", "restart", "eianun-vpngate.service"])
+    run_service_action("restart")
     print("已发送重启指令。")
     time.sleep(1)
 
 def show_logs():
     print("正在查看 eianun 二改版本 日志 (按 Ctrl+C 退出)...", flush=True)
-    if os.path.exists(LOG_FILE):
-        try:
+    mgr = detect_service_manager()
+    try:
+        if mgr == "systemd" and command_exists("journalctl"):
+            subprocess.run(["journalctl", "-u", SYSTEMD_SERVICE, "-f", "-n", "80"])
+            return
+        if os.path.exists(LOG_FILE):
             subprocess.run(["tail", "-f", "-n", "50", LOG_FILE])
-        except KeyboardInterrupt:
-            pass
-    else:
-        print(f"日志文件不存在: {LOG_FILE}")
-        time.sleep(2)
+            return
+        logs_dir = os.path.join(INSTALL_DIR, "vpngate_data", "logs")
+        if os.path.isdir(logs_dir):
+            files = sorted([os.path.join(logs_dir, f) for f in os.listdir(logs_dir) if f.endswith(".json")])
+            if files:
+                subprocess.run(["tail", "-f", "-n", "80", files[-1]])
+                return
+        run_service_action("status")
+    except KeyboardInterrupt:
+        pass
 
 def update_service():
     print("正在获取远程更新并检测版本...", flush=True)
@@ -551,7 +657,7 @@ def update_service():
             subprocess.run(["find", ".", "-type", "d", "-name", "__pycache__", "-exec", "rm", "-rf", "{}", "+"], check=False)
             
             print("代码拉取成功，正在重新运行安装脚本...", flush=True)
-            subprocess.run(["bash", "install.sh"])
+            subprocess.run(["sh", "install.sh"])
             print("更新已完成！")
             time.sleep(2)
         except Exception as e:
@@ -565,20 +671,36 @@ def uninstall_service():
     confirm = input("确定要完全卸载 eianun 二改版本 吗？(y/N): ")
     if confirm.lower() == 'y':
         print("正在完全卸载 eianun 二改版本...", flush=True)
-        subprocess.run(["systemctl", "stop", "eianun-vpngate.service"])
-        subprocess.run(["systemctl", "disable", "eianun-vpngate.service"])
-        try:
-            os.unlink("/lib/systemd/system/eianun-vpngate.service")
-        except Exception:
-            pass
-        try:
-            os.unlink("/usr/bin/eianun")
-        except Exception:
-            pass
-        try:
-            os.unlink("/usr/bin/ml")
-        except Exception:
-            pass
+        mgr = detect_service_manager()
+        if mgr == "systemd":
+            subprocess.run(["systemctl", "stop", SYSTEMD_SERVICE])
+            subprocess.run(["systemctl", "disable", SYSTEMD_SERVICE])
+            for p in ["/etc/systemd/system/eianun-vpngate.service", "/lib/systemd/system/eianun-vpngate.service"]:
+                try:
+                    os.unlink(p)
+                except Exception:
+                    pass
+            subprocess.run(["systemctl", "daemon-reload"])
+        elif mgr == "openrc":
+            subprocess.run(["rc-service", SERVICE_NAME, "stop"])
+            subprocess.run(["rc-update", "del", SERVICE_NAME, "default"])
+            try:
+                os.unlink("/etc/init.d/eianun-vpngate")
+            except Exception:
+                pass
+        elif mgr == "runit":
+            subprocess.run(["sv", "down", SERVICE_NAME])
+            for p in ["/var/service/eianun-vpngate", "/etc/service/eianun-vpngate"]:
+                try:
+                    os.unlink(p)
+                except Exception:
+                    pass
+            subprocess.run(["rm", "-rf", "/etc/sv/eianun-vpngate"])
+        for p in ["/usr/bin/eianun", "/usr/bin/ml"]:
+            try:
+                os.unlink(p)
+            except Exception:
+                pass
         subprocess.run(["rm", "-rf", INSTALL_DIR])
         print("eianun 二改版本 已卸载！")
         sys.exit(0)
@@ -590,7 +712,7 @@ def ask_restart():
     ans = input("配置已保存。是否立即重启服务生效？(Y/n): ").strip().lower()
     if ans in ('', 'y', 'yes'):
         print("正在重启 eianun 二改版本 服务...", flush=True)
-        subprocess.run(["systemctl", "restart", "eianun-vpngate.service"])
+        run_service_action("restart")
         print("服务已重启。")
         time.sleep(1.5)
 
@@ -924,94 +1046,60 @@ EOF
 chmod +x /usr/bin/eianun
 ln -sf /usr/bin/eianun /usr/bin/ml
 
-# 7. Configure Custom parameters (First-time installation check)
 AUTH_FILE="${INSTALL_DIR}/vpngate_data/ui_auth.json"
 mkdir -p "${INSTALL_DIR}/vpngate_data"
-
 if [ ! -f "$AUTH_FILE" ]; then
-    echo -e "\n${YELLOW}检测到是首次安装，是否需要自定义配置网页端参数（端口/安全后缀/登录账号密码）？${PLAIN}"
-    read -p "是否自定义配置？[y/N]: " is_custom
-    
-    # Initialize defaults
+    say "\n${YELLOW}检测到是首次安装，是否需要自定义配置网页端参数（端口/安全后缀/登录账号密码/拉取地区）？${PLAIN}"
+    ask "是否自定义配置？[y/N]: "
+    is_custom="$REPLY_VALUE"
     UI_PORT=8787
-    # generate random secret suffix (12 chars alphanumeric)
-    SECRET_PATH=$(${PYTHON_BIN} -c "import random, string; print(''.join(random.choices(string.ascii_letters + string.digits, k=12)))")
-    # generate random password
-    UI_PASSWORD=$(${PYTHON_BIN} -c "
-import random, string
-chars = string.ascii_letters + string.digits
+    SECRET_PATH="$(${PYTHON_BIN} -c "import random,string; print(''.join(random.choices(string.ascii_letters + string.digits, k=12)))")"
+    UI_PASSWORD="$(${PYTHON_BIN} -c "import random,string
+chars=string.ascii_letters+string.digits
 while True:
-    pwd = ''.join(random.choices(chars, k=12))
-    if any(c.islower() for c in pwd) and any(c.isupper() for c in pwd) and any(c.isdigit() for c in pwd):
-        print(pwd)
-        break
-")
-    UI_USERNAME=$(${PYTHON_BIN} -c "
-import random, string
-chars = string.ascii_letters + string.digits
+ p=''.join(random.choices(chars,k=12))
+ if any(c.islower() for c in p) and any(c.isupper() for c in p) and any(c.isdigit() for c in p): print(p); break")"
+    UI_USERNAME="$(${PYTHON_BIN} -c "import random,string
+chars=string.ascii_letters+string.digits
 while True:
-    uname = ''.join(random.choices(chars, k=12))
-    if uname[0].isalpha() and any(c.islower() for c in uname) and any(c.isupper() for c in uname) and any(c.isdigit() for c in uname):
-        print(uname)
-        break
-")
+ u=''.join(random.choices(chars,k=12))
+ if u[0].isalpha() and any(c.islower() for c in u) and any(c.isupper() for c in u) and any(c.isdigit() for c in u): print(u); break")"
+    TARGET_COUNTRIES_INPUT=""
 
-    if [[ "$is_custom" =~ ^[Yy]$ ]]; then
-        # Step-by-step custom inputs
-        # 1. Custom port
-        while true; do
-            read -p "请输入自定义管理端口 [1-65535, 默认 8787]: " input_port
-            if [ -z "$input_port" ]; then
-                UI_PORT=8787
-                break
-            fi
-            if [[ "$input_port" =~ ^[0-9]+$ ]] && [ "$input_port" -ge 1 ] && [ "$input_port" -le 65535 ]; then
-                UI_PORT=$input_port
-                break
-            else
-                echo -e "${RED}输入错误: 端口必须是 1 到 65535 之间的数字！${PLAIN}"
-            fi
-        done
-        
-        # 2. Custom suffix
-        while true; do
-            read -p "请输入网页登录自定义安全后缀 [字母与数字组合, 默认随机]: " input_suffix
-            if [ -z "$input_suffix" ]; then
-                break
-            fi
-            if [[ "$input_suffix" =~ ^[A-Za-z0-9]+$ ]]; then
-                SECRET_PATH=$input_suffix
-                break
-            else
-                echo -e "${RED}输入错误: 后缀仅能由英文字母和数字组成！${PLAIN}"
-            fi
-        done
-        
-        # 3. Custom login username and password
-        read -p "请输入登录账号 [默认 $UI_USERNAME]: " input_user
-        if [ -n "$input_user" ]; then
-            UI_USERNAME=$input_user
-        fi
-        
-        while true; do
-            read -p "请输入登录密码 [默认随机生成, 建议包含字母、数字与符号]: " input_pass
-            if [ -z "$input_pass" ]; then
-                break
-            fi
-            if [ ${#input_pass} -ge 4 ]; then
-                UI_PASSWORD=$input_pass
-                break
-            else
-                echo -e "${RED}输入错误: 密码长度不能少于 4 位！${PLAIN}"
-            fi
-        done
-
-        read -p "请输入节点拉取地区 [留空=全部地区，例如 JP,日本,US]: " TARGET_COUNTRIES_INPUT
-    fi
-
+    case "$is_custom" in
+        y|Y)
+            while :; do
+                ask "请输入自定义管理端口 [1-65535, 默认 8787]: "
+                input_port="$REPLY_VALUE"
+                if [ -z "$input_port" ]; then UI_PORT=8787; break; fi
+                case "$input_port" in
+                    *[!0-9]*|'') say "${RED}输入错误: 端口必须是 1 到 65535 之间的数字！${PLAIN}" ;;
+                    *) if [ "$input_port" -ge 1 ] && [ "$input_port" -le 65535 ]; then UI_PORT="$input_port"; break; else say "${RED}输入错误: 端口必须是 1 到 65535 之间的数字！${PLAIN}"; fi ;;
+                esac
+            done
+            while :; do
+                ask "请输入网页登录自定义安全后缀 [字母与数字组合, 默认随机]: "
+                input_suffix="$REPLY_VALUE"
+                if [ -z "$input_suffix" ]; then break; fi
+                case "$input_suffix" in
+                    *[!A-Za-z0-9]* ) say "${RED}输入错误: 后缀仅能由英文字母和数字组成！${PLAIN}" ;;
+                    * ) SECRET_PATH="$input_suffix"; break ;;
+                esac
+            done
+            ask "请输入登录账号 [默认 $UI_USERNAME]: "
+            input_user="$REPLY_VALUE"
+            if [ -n "$input_user" ]; then UI_USERNAME="$input_user"; fi
+            while :; do
+                ask "请输入登录密码 [默认随机生成, 建议包含字母、数字与符号]: "
+                input_pass="$REPLY_VALUE"
+                if [ -z "$input_pass" ]; then break; fi
+                if [ ${#input_pass} -ge 4 ]; then UI_PASSWORD="$input_pass"; break; else say "${RED}输入错误: 密码长度不能少于 4 位！${PLAIN}"; fi
+            done
+            ask "请输入节点拉取地区 [留空=全部地区，例如 JP,日本,US]: "
+            TARGET_COUNTRIES_INPUT="$REPLY_VALUE"
+            ;;
+    esac
     TARGET_COUNTRIES_INPUT="${TARGET_COUNTRIES_INPUT:-}"
-
-    # Write config JSON
     ${PYTHON_BIN} -c "
 import json
 cfg = {
@@ -1027,44 +1115,44 @@ with open('$AUTH_FILE', 'w', encoding='utf-8') as f:
 "
 fi
 
-# 8. Start service
-echo -e "\n正在启动 eianun 二改版本 服务并初始化网络..."
-systemctl restart eianun-vpngate.service || true
+restart_registered_service() {
+    SERVICE_MANAGER="$(detect_service_manager)"
+    case "$SERVICE_MANAGER" in
+        systemd) systemctl restart eianun-vpngate.service || true ;;
+        openrc) rc-service eianun-vpngate restart || rc-service eianun-vpngate start || true ;;
+        runit) sv restart eianun-vpngate || sv up eianun-vpngate || true ;;
+    esac
+}
 
-# Wait and poll for node loading and active connection
-echo -e "\n正在等待 eianun 二改版本 首次获取节点并建立加密通道 (此过程可能需要 5-30 秒)..."
+say "\n正在启动 eianun 二改版本 服务并初始化网络..."
+restart_registered_service
+
+say "\n正在等待 eianun 二改版本 首次获取节点并建立加密通道 (此过程可能需要 5-30 秒)..."
 ACTIVE_ID=""
 LAST_MSG=""
-for i in {1..90}; do
+i=1
+while [ "$i" -le 90 ]; do
     if [ -f "${INSTALL_DIR}/vpngate_data/state.json" ]; then
-        ACTIVE_ID=$(${PYTHON_BIN} -c "import json; print(json.load(open('${INSTALL_DIR}/vpngate_data/state.json')).get('active_openvpn_node_id', ''))" 2>/dev/null || echo "")
-        IS_CONN=$(${PYTHON_BIN} -c "import json; print(json.load(open('${INSTALL_DIR}/vpngate_data/state.json')).get('is_connecting', False))" 2>/dev/null || echo "False")
-        CUR_MSG=$(${PYTHON_BIN} -c "import json; print(json.load(open('${INSTALL_DIR}/vpngate_data/state.json')).get('last_check_message', ''))" 2>/dev/null || echo "")
-        
+        ACTIVE_ID="$(${PYTHON_BIN} -c "import json; print(json.load(open('${INSTALL_DIR}/vpngate_data/state.json')).get('active_openvpn_node_id', ''))" 2>/dev/null || echo "")"
+        IS_CONN="$(${PYTHON_BIN} -c "import json; print(json.load(open('${INSTALL_DIR}/vpngate_data/state.json')).get('is_connecting', False))" 2>/dev/null || echo "False")"
+        CUR_MSG="$(${PYTHON_BIN} -c "import json; print(json.load(open('${INSTALL_DIR}/vpngate_data/state.json')).get('last_check_message', ''))" 2>/dev/null || echo "")"
         if [ "$IS_CONN" = "False" ] || [ "$IS_CONN" = "false" ]; then
             if [ -n "$ACTIVE_ID" ]; then
-                echo -e "  -> ${GREEN}[已就绪]${PLAIN} 首次节点连接成功，活动节点: ${GREEN}$ACTIVE_ID${PLAIN}"
+                say "  -> ${GREEN}[已就绪]${PLAIN} 首次节点连接成功，活动节点: ${GREEN}$ACTIVE_ID${PLAIN}"
                 break
             else
-                if [ -n "$CUR_MSG" ] && [ "$CUR_MSG" != "$LAST_MSG" ]; then
-                    echo -e "  -> 提示: ${YELLOW}${CUR_MSG}${PLAIN}"
-                    LAST_MSG="$CUR_MSG"
-                fi
+                if [ -n "$CUR_MSG" ] && [ "$CUR_MSG" != "$LAST_MSG" ]; then say "  -> 提示: ${YELLOW}${CUR_MSG}${PLAIN}"; LAST_MSG="$CUR_MSG"; fi
             fi
         else
-            if [ -n "$CUR_MSG" ] && [ "$CUR_MSG" != "$LAST_MSG" ]; then
-                echo -e "  -> 状态: ${YELLOW}${CUR_MSG}${PLAIN}"
-                LAST_MSG="$CUR_MSG"
-            fi
+            if [ -n "$CUR_MSG" ] && [ "$CUR_MSG" != "$LAST_MSG" ]; then say "  -> 状态: ${YELLOW}${CUR_MSG}${PLAIN}"; LAST_MSG="$CUR_MSG"; fi
         fi
     else
-        echo -n "."
+        printf '.'
     fi
+    i=$((i + 1))
     sleep 1
 done
-if [ -z "$ACTIVE_ID" ]; then
-    echo -e "  -> ${YELLOW}[加载超时]${PLAIN} 首次节点获取或连接超时，将在后台继续尝试..."
-fi
+if [ -z "$ACTIVE_ID" ]; then say "  -> ${YELLOW}[加载超时]${PLAIN} 首次节点获取或连接超时，将在后台继续尝试..."; fi
 
 SECRET_PATH="EJsW2EeBo9lY"
 USERNAME="未配置"
@@ -1072,29 +1160,27 @@ PASSWORD="未配置"
 UI_PORT=8787
 AUTH_FILE="${INSTALL_DIR}/vpngate_data/ui_auth.json"
 if [ -f "$AUTH_FILE" ]; then
-    SECRET_PATH=$(${PYTHON_BIN} -c "import json; print(json.load(open('$AUTH_FILE')).get('secret_path', 'EJsW2EeBo9lY'))" 2>/dev/null || echo "EJsW2EeBo9lY")
-    USERNAME=$(${PYTHON_BIN} -c "import json; print(json.load(open('$AUTH_FILE')).get('username', '未配置'))" 2>/dev/null || echo "未配置")
-    PASSWORD=$(${PYTHON_BIN} -c "import json; print(json.load(open('$AUTH_FILE')).get('password', '未配置'))" 2>/dev/null || echo "未配置")
-    UI_PORT=$(${PYTHON_BIN} -c "import json; print(json.load(open('$AUTH_FILE')).get('port', 8787))" 2>/dev/null || echo "8787")
+    SECRET_PATH="$(${PYTHON_BIN} -c "import json; print(json.load(open('$AUTH_FILE')).get('secret_path', 'EJsW2EeBo9lY'))" 2>/dev/null || echo "EJsW2EeBo9lY")"
+    USERNAME="$(${PYTHON_BIN} -c "import json; print(json.load(open('$AUTH_FILE')).get('username', '未配置'))" 2>/dev/null || echo "未配置")"
+    PASSWORD="$(${PYTHON_BIN} -c "import json; print(json.load(open('$AUTH_FILE')).get('password', '未配置'))" 2>/dev/null || echo "未配置")"
+    UI_PORT="$(${PYTHON_BIN} -c "import json; print(json.load(open('$AUTH_FILE')).get('port', 8787))" 2>/dev/null || echo "8787")"
 fi
 
-# Get VPS public IP
-echo -e "正在获取 VPS 公网 IP..."
-PUBLIC_IP=$(curl -s --max-time 3 https://api.ipify.org || curl -s --max-time 3 https://ifconfig.me || curl -s --max-time 3 icanhazip.com || echo "您的服务器公网IP")
-echo -n "$PUBLIC_IP" > "${INSTALL_DIR}/vpngate_data/public_ip.txt"
+say "正在获取 VPS 公网 IP..."
+PUBLIC_IP="$(curl -s --max-time 3 https://api.ipify.org || curl -s --max-time 3 https://ifconfig.me || curl -s --max-time 3 icanhazip.com || echo "您的服务器公网IP")"
+printf '%s' "$PUBLIC_IP" > "${INSTALL_DIR}/vpngate_data/public_ip.txt"
 
-echo -e "\n${GREEN}==========================================================${PLAIN}"
-echo -e "${GREEN}             eianun 二改版本 源码一键部署已完成！${PLAIN}"
-echo -e "${GREEN}==========================================================${PLAIN}"
-echo -e "  * 网页控制面板:  ${BLUE}http://${PUBLIC_IP}:${UI_PORT}/${SECRET_PATH}/${PLAIN}"
-echo -e "  * 网页管理账号:  ${YELLOW}${USERNAME}${PLAIN}"
-echo -e "  * 网页管理密码:  ${YELLOW}${PASSWORD}${PLAIN}"
-echo -e "  * HTTP/SOCKS5 代理端口:  ${BLUE}http://127.0.0.1:7928/${PLAIN}"
-echo -e " --------------------------------------------------------"
-echo -e "  * 快速状态指令:   ${YELLOW}eianun status${PLAIN}  或兼容别名  ${YELLOW}ml${PLAIN}"
-echo -e "  * 查看实时日志:   ${YELLOW}eianun logs${PLAIN}"
-echo -e "  * 停止服务:       ${YELLOW}eianun stop${PLAIN}"
-echo -e "  * 重启服务:       ${YELLOW}eianun restart${PLAIN}
-  * 设置拉取地区:   ${YELLOW}eianun country${PLAIN}"
-echo -e "=========================================================="
-echo
+say "\n${GREEN}==========================================================${PLAIN}"
+say "${GREEN}             eianun 二改版本 源码一键部署已完成！${PLAIN}"
+say "${GREEN}==========================================================${PLAIN}"
+say "  * 网页控制面板:  ${BLUE}http://${PUBLIC_IP}:${UI_PORT}/${SECRET_PATH}/${PLAIN}"
+say "  * 网页管理账号:  ${YELLOW}${USERNAME}${PLAIN}"
+say "  * 网页管理密码:  ${YELLOW}${PASSWORD}${PLAIN}"
+say "  * HTTP/SOCKS5 代理端口:  ${BLUE}http://127.0.0.1:7928/${PLAIN}"
+say " --------------------------------------------------------"
+say "  * 快速状态指令:   ${YELLOW}eianun status${PLAIN}  或兼容别名  ${YELLOW}ml${PLAIN}"
+say "  * 查看实时日志:   ${YELLOW}eianun logs${PLAIN}"
+say "  * 停止服务:       ${YELLOW}eianun stop${PLAIN}"
+say "  * 重启服务:       ${YELLOW}eianun restart${PLAIN}"
+say "  * 设置拉取地区:   ${YELLOW}eianun country${PLAIN}"
+say "=========================================================="
