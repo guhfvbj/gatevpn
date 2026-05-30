@@ -48,6 +48,8 @@ LOCAL_PROXY_PORT = int(os.environ.get("LOCAL_PROXY_PORT", "7928"))
 UI_HOST = os.environ.get("UI_HOST", "0.0.0.0")
 UI_PORT = int(os.environ.get("UI_PORT", "8787"))
 INVALID_BACKOFF_SECONDS = int(os.environ.get("INVALID_BACKOFF_SECONDS", str(30 * 60)))
+# 1 = 手动选择某个地区节点后，故障转移只在同地区内切换；0 = 同地区无可用时允许跨地区兜底。
+STRICT_COUNTRY_FAILOVER = os.environ.get("STRICT_COUNTRY_FAILOVER", "1").strip().lower() not in {"0", "false", "no", "off"}
 TARGET_COUNTRIES_ENV = os.environ.get("VPNGATE_TARGET_COUNTRIES") or os.environ.get("TARGET_COUNTRIES") or os.environ.get("TARGET_COUNTRY") or ""
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
@@ -222,6 +224,107 @@ def row_matches_target_countries(row: dict[str, str], targets: list[str]) -> boo
             return True
     return False
 
+
+def node_country_tokens(node: dict[str, Any]) -> set[str]:
+    """Return normalized country tokens for a cached/tested node."""
+    country_short = str(node.get("country_short") or "").strip()
+    country = str(node.get("country") or "").strip()
+    tokens = {country_short, country}
+    reverse_translations = {normalize_country_token(v): k for k, v in vpn_utils.COUNTRY_TRANSLATIONS.items()}
+    if normalize_country_token(country) in reverse_translations:
+        tokens.add(reverse_translations[normalize_country_token(country)])
+    alias_map = {
+        "JP": ["Japan", "日本"],
+        "KR": ["Korea Republic of", "Korea", "Republic of Korea", "韩国", "南韩"],
+        "US": ["United States", "USA", "United States of America", "美国"],
+        "GB": ["United Kingdom", "UK", "Great Britain", "英国"],
+        "TW": ["Taiwan", "台湾", "台灣"],
+        "HK": ["Hong Kong", "香港"],
+        "SG": ["Singapore", "新加坡"],
+        "TH": ["Thailand", "泰国", "泰國"],
+        "VN": ["Viet Nam", "Vietnam", "越南"],
+        "CN": ["China", "中国", "中國"],
+        "DE": ["Germany", "德国", "德國"],
+        "FR": ["France", "法国", "法國"],
+        "NL": ["Netherlands", "荷兰", "荷蘭"],
+        "CA": ["Canada", "加拿大"],
+        "AU": ["Australia", "澳大利亚", "澳洲"],
+        "RU": ["Russian Federation", "Russia", "Russian", "俄罗斯", "俄羅斯"],
+    }
+    for code, aliases in alias_map.items():
+        normalized_aliases = {normalize_country_token(x) for x in aliases}
+        if country_short.upper() == code or normalize_country_token(country) in normalized_aliases:
+            tokens.add(code)
+            tokens.update(aliases)
+    return {normalize_country_token(token) for token in tokens if token}
+
+def node_matches_target_countries(node: dict[str, Any], targets: list[str]) -> bool:
+    if not targets:
+        return True
+    node_tokens = node_country_tokens(node)
+    for target in targets:
+        token = normalize_country_token(target)
+        if token and token in node_tokens:
+            return True
+    return False
+
+def node_ip_priority_rank(node: dict[str, Any]) -> int:
+    """Lower is better. Prefer residential exit IPs during sorting and failover."""
+    ip_type = str(node.get("ip_type") or "").strip().lower()
+    quality = str(node.get("quality") or "").strip().lower()
+    if ip_type == "residential" and quality in {"", "normal", "residential"}:
+        return 0
+    if ip_type == "residential":
+        return 1
+    if ip_type == "mobile" or quality == "mobile":
+        return 2
+    if quality in {"", "normal"} and ip_type in {"", "unknown"}:
+        return 3
+    if ip_type == "hosting" or quality in {"hosting", "datacenter"}:
+        return 4
+    if ip_type == "proxy" or quality == "proxy":
+        return 5
+    return 6
+
+def node_sort_key(node: dict[str, Any]) -> tuple[int, int, int, int]:
+    return (
+        node_ip_priority_rank(node),
+        parse_int(node.get("latency_ms")) or 999999,
+        parse_int(node.get("ping")) or 999999,
+        -parse_int(node.get("score")),
+    )
+
+def get_failover_targets(active_node: dict[str, Any] | None = None) -> list[str]:
+    """Return the country scope used by auto failover.
+
+    Priority:
+    1) Explicit 拉取地区过滤 in settings/env;
+    2) The country of the last manually connected node;
+    3) The currently active node country.
+    """
+    configured = get_target_countries()
+    if configured:
+        return configured
+    state = read_json(STATE_FILE, {})
+    saved = state.get("failover_country_short") or state.get("failover_country") or ""
+    if saved:
+        return split_target_countries(saved)
+    if active_node:
+        country_short = active_node.get("country_short") or ""
+        country = active_node.get("country") or ""
+        return split_target_countries(country_short or country)
+    return []
+
+def set_failover_scope_from_node(node: dict[str, Any]) -> None:
+    country_short = str(node.get("country_short") or "").strip()
+    country = str(node.get("country") or "").strip()
+    set_state(
+        failover_country_short=country_short,
+        failover_country=country,
+        failover_country_display=country or country_short or "未固定",
+        strict_country_failover=STRICT_COUNTRY_FAILOVER,
+    )
+
 def get_session_token(password: str, username: str = "admin") -> str:
     salt = "eianun_vpngate_secure_salt_2026"
     return hashlib.sha256((username + ":" + password + salt).encode("utf-8")).hexdigest()
@@ -292,6 +395,10 @@ def get_state() -> dict[str, Any]:
     target_countries = normalize_target_countries_input(ui_cfg.get("target_countries") or TARGET_COUNTRIES_ENV)
     state["target_countries"] = target_countries
     state["target_countries_display"] = target_countries or "全部地区"
+    state.setdefault("failover_country_short", "")
+    state.setdefault("failover_country", "")
+    state.setdefault("failover_country_display", target_countries or "未固定")
+    state["strict_country_failover"] = STRICT_COUNTRY_FAILOVER
     
     return state
 
@@ -368,11 +475,11 @@ def row_to_node(row: dict[str, str], config_text: str) -> dict[str, Any]:
         "probed_at": 0,
     }
 
-def fetch_candidates() -> list[dict[str, Any]]:
+def fetch_candidates(target_override: list[str] | None = None) -> list[dict[str, Any]]:
     blacklist = load_blacklist()
     candidates: list[dict[str, Any]] = []
     seen_ips = set()
-    target_countries = get_target_countries()
+    target_countries = target_override if target_override is not None else get_target_countries()
     target_display = normalize_target_countries_input(target_countries) or "全部地区"
     
     # 检查本地是否有节点缓存，以确定最大重试尝试次数
@@ -672,15 +779,15 @@ def active_openvpn_running() -> bool:
 def sort_all_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     available_nodes = sorted(
         [n for n in nodes if n.get("probe_status") == "available" or n.get("active")],
-        key=lambda n: (parse_int(n.get("latency_ms")) or 999999, -parse_int(n.get("score")))
+        key=node_sort_key
     )
     untested_nodes = sorted(
         [n for n in nodes if n.get("probe_status") == "not_checked" and not n.get("active")],
-        key=lambda n: (-parse_int(n.get("score")), parse_int(n.get("ping")))
+        key=lambda n: (node_ip_priority_rank(n), -parse_int(n.get("score")), parse_int(n.get("ping")))
     )
     unavailable_nodes = sorted(
         [n for n in nodes if n.get("probe_status") == "unavailable" and not n.get("active")],
-        key=lambda n: (-parse_int(n.get("score")), -float(n.get("probed_at", 0)))
+        key=lambda n: (node_ip_priority_rank(n), -parse_int(n.get("score")), -float(n.get("probed_at", 0)))
     )
     return available_nodes + untested_nodes + unavailable_nodes
 
@@ -859,32 +966,43 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
 def auto_switch_node(attempt: int = 0) -> None:
     if attempt >= 3:
         print("[自动切换] 连续切换失败已达 3 次，停止切换以防止主线程死锁，将在后台重新加载节点...", flush=True)
+        set_state(last_check_message="自动切换连续失败，将等待下一轮节点维护")
         return
         
-    # Find the next best available node
     with lock:
         nodes = read_json(NODES_FILE, [])
-        candidates = [
+        active_node = next((n for n in nodes if n.get("id") == active_openvpn_node_id or n.get("active")), None)
+        failover_targets = get_failover_targets(active_node)
+        all_candidates = [
             n for n in nodes 
             if n.get("probe_status") == "available" 
             and not n.get("active")
         ]
-        candidates.sort(key=lambda n: (parse_int(n.get("latency_ms")) or 999999, -parse_int(n.get("score"))))
+        scoped_candidates = [n for n in all_candidates if node_matches_target_countries(n, failover_targets)] if failover_targets else all_candidates
+        candidates = scoped_candidates
+        if not candidates and not STRICT_COUNTRY_FAILOVER:
+            candidates = all_candidates
+        candidates.sort(key=node_sort_key)
+        scope_display = normalize_target_countries_input(failover_targets) if failover_targets else "全部地区"
         
     if candidates:
         next_node = candidates[0]
-        msg = f"当前连接已失效或代理连通性检测失败，正在自动切换至最佳备用节点: {next_node['id']}"
+        ip_kind = "住宅IP优先" if node_ip_priority_rank(next_node) == 0 else "可用IP兜底"
+        msg = f"当前连接已失效或代理连通性检测失败，正在按固定地区 {scope_display} 自动切换至备用节点: {next_node['id']} ({ip_kind})"
         print(f"[自动切换] {msg}", flush=True)
         log_to_json("INFO", "VPN", msg)
         try:
-            connect_node(next_node["id"])
+            connect_node(next_node["id"], update_failover_scope=False)
         except Exception as e:
             err_msg = f"切换到备用节点 {next_node['id']} 失败: {e}，将尝试下一个..."
             print(f"[自动切换] {err_msg}", flush=True)
             log_to_json("WARNING", "VPN", err_msg)
             auto_switch_node(attempt + 1)
     else:
-        msg = "没有可用的备选节点，将自动断开并清理当前连接状态，同时在后台异步获取新节点..."
+        if failover_targets:
+            msg = f"固定地区 {scope_display} 当前没有可用备用节点，将清理当前连接并后台拉取同地区新节点..."
+        else:
+            msg = "没有可用的备选节点，将自动断开并清理当前连接状态，同时在后台异步获取新节点..."
         print(f"[自动切换] {msg}", flush=True)
         log_to_json("WARNING", "VPN", msg)
         stop_active_openvpn()
@@ -893,18 +1011,18 @@ def auto_switch_node(attempt: int = 0) -> None:
             for item in nodes:
                 item["active"] = False
             write_json(NODES_FILE, nodes)
-        set_state(active_openvpn_node_id="", last_check_message="没有可用的备选节点，已断开")
+        set_state(active_openvpn_node_id="", last_check_message=msg)
         
         def bg_fetch_and_switch():
             try:
-                maintain_valid_nodes(force=False)
+                maintain_valid_nodes(force=False, target_override=failover_targets if failover_targets else None)
                 auto_switch_node()
             except Exception as e:
                 print(f"[自动切换后台补齐] 获取并测试节点失败: {e}", flush=True)
         
         threading.Thread(target=bg_fetch_and_switch, daemon=True).start()
 
-def connect_node(node_id: str) -> str:
+def connect_node(node_id: str, update_failover_scope: bool = True) -> str:
     global active_openvpn_process, active_openvpn_node_id, is_connecting
     with lock:
         if is_connecting:
@@ -953,6 +1071,8 @@ def connect_node(node_id: str) -> str:
             
         active_openvpn_process = process
         active_openvpn_node_id = node_id
+        if update_failover_scope:
+            set_failover_scope_from_node(node)
         
         set_state(active_node_latency="配置路由", last_check_message="正在配置策略路由规则与流量转发...")
         setup_policy_routing("tun0")
@@ -1003,7 +1123,7 @@ def connect_node(node_id: str) -> str:
         with lock:
             is_connecting = False
 
-def maintain_valid_nodes(force: bool = False) -> str:
+def maintain_valid_nodes(force: bool = False, target_override: list[str] | None = None) -> str:
     global active_openvpn_process, active_openvpn_node_id, is_connecting
     ensure_dirs()
     is_connecting = True
@@ -1025,7 +1145,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
 
         try:
             set_state(is_connecting=True, last_check_message="正在拉取最新的免费 VPN 节点列表...")
-            candidates = fetch_candidates()
+            candidates = fetch_candidates(target_override=target_override)
         except Exception as exc:
             vpn_utils.check_and_fix_dns()
             set_state(last_fetch_at=time.time(), last_fetch_status="error", last_fetch_message=str(exc))
@@ -2649,7 +2769,8 @@ function render(){
   const statusMessage = state.last_check_message || "";
   const activeNodeInfo = activeNode ? `<span class="badge available" style="margin-left:8px; padding:2px 8px;">${esc(translateCountry(activeNode.country))} (${activeNode.id})</span>` : `<span class="badge unavailable" style="margin-left:8px; padding:2px 8px;">无</span>`;
   const targetInfo = state.target_countries_display || state.target_countries || "全部地区";
-  $("status").innerHTML=`<span class="status-dot"></span>HTTP 代理本地接口：http://127.0.0.1:7928 | 拉取地区：${esc(targetInfo)} | 活动节点：${activeNodeInfo} | 状态：${statusMessage}`;
+  const failoverInfo = state.failover_country_display || targetInfo || "未固定";
+  $("status").innerHTML=`<span class="status-dot"></span>HTTP 代理本地接口：http://127.0.0.1:7928 | 拉取地区：${esc(targetInfo)} | 故障转移地区：${esc(failoverInfo)} | 活动节点：${activeNodeInfo} | 状态：${statusMessage}`;
   
   // Update proxy test status card based on background checks
   const pBadge = $("proxy_status_badge");
@@ -3617,7 +3738,7 @@ class Handler(BaseHTTPRequestHandler):
                 global last_active_ping_time, last_active_latency
                 last_active_ping_time = 0.0
                 last_active_latency = 0
-                set_state(active_openvpn_node_id="", last_check_message="手动断开连接", active_node_latency="无活动连接")
+                set_state(active_openvpn_node_id="", last_check_message="手动断开连接", active_node_latency="无活动连接", failover_country_short="", failover_country="", failover_country_display="未固定")
                 self.send_json({"ok": True})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)

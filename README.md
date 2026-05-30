@@ -1,14 +1,14 @@
-# eianun  🌐
+# Eianun免费聚合落地IP 🌐
 
-基于 VPNGate + OpenVPN 的 Linux VPS 出站代理网关二改版。此版本已去除原项目广告入口，并新增“指定地区拉取节点”功能。
+基于 VPNGate + OpenVPN 的 Linux VPS 出站代理网关二改版。此版本已去除原项目广告入口，新增指定地区拉取、同地区故障转移、住宅 IP 优先选择。
 
 ## 主要改动
 
-- 名称统一改为 **eianun **。
+- 名称统一改为 **Eianun免费聚合落地IP**。
 - 移除 Web UI 里的 VPS 推广广告和 README 中的推广徽章/链接。
 - 新增后端节点地区过滤：可只保留指定国家/地区的 VPNGate 节点，不再默认把全部地区节点都写入节点池。
 - Web 管理后台“管理员设置”新增 **拉取地区过滤** 输入框。
-- 安装后的命令行工具改为 `eianun`，同时保留 `ml` 兼容别名。
+- 安装后的主命令改为 `en`，同时保留 `eianun` 兼容别名，安装时会删除旧 `ml`。
 - 安装脚本已适配主流 Linux 包管理器：APT、DNF、YUM、Pacman、Zypper。
 
 ## 支持系统
@@ -75,7 +75,7 @@ JP,日本,US,美国
 2. 命令行执行：
 
 ```bash
-eianun country
+en country
 ```
 
 3. 环境变量方式，例如 `/etc/default/eianun-vpngate`：
@@ -85,6 +85,20 @@ VPNGATE_TARGET_COUNTRIES=JP,日本
 ```
 
 留空表示拉取全部地区。
+
+
+## 固定地区与故障转移
+
+- 如果你在“拉取地区过滤”里设置了 `GB,英国`，系统只拉取英国节点，自动切换也只在英国节点中进行。
+- 如果没有设置拉取地区，但你在面板手动选择了某个英国节点，系统会把该节点国家记录为故障转移地区；后续该节点失效时，会优先在英国节点中自动切换。
+- 自动切换排序会优先选择已检测为 `住宅 IP` 的节点，其次再按延迟、Ping、分数排序。
+- 默认开启严格同地区故障转移；如需在同地区无可用节点时允许跨地区兜底，可在环境变量中设置：
+
+```bash
+STRICT_COUNTRY_FAILOVER=0
+```
+
+注意：VPNGate 节点由第三方志愿节点提供，住宅/机房/代理类型识别依赖公开 IP 数据源，不能保证 100% 准确，但会作为自动切换的优先级依据。
 
 ## 常用命令
 
@@ -97,12 +111,12 @@ eianun logs        # 查看日志
 eianun web         # 修改网页绑定地址/安全后缀
 eianun port        # 修改网页端口
 eianun password    # 修改管理账号密码
-eianun country     # 设置节点拉取地区
+en country     # 设置节点拉取地区
 eianun update      # 从 GitHub 更新
 eianun uninstall   # 卸载
 ```
 
-兼容旧命令：`ml` 仍会指向 `eianun`。
+兼容命令：`eianun` 会指向 `en`；旧 `ml` 会在安装时自动删除。
 
 ## 架构
 
