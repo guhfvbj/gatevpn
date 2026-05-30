@@ -14,26 +14,119 @@ if [[ "$(id -u)" != "0" ]]; then
     exit 1
 fi
 
-# 2. Check OS distribution (Ubuntu only)
+# 2. Detect Linux distribution and package manager
 if [ -f /etc/os-release ]; then
     . /etc/os-release
-    if [[ "${ID:-}" != "ubuntu" ]]; then
-        echo -e "${RED}错误: 本系统不是 Ubuntu！目前 eianun 二改版本 仅支持 Ubuntu 系统。${PLAIN}"
-        exit 1
-    fi
+    OS_ID="${ID:-unknown}"
+    OS_NAME="${PRETTY_NAME:-$OS_ID}"
 else
-    echo -e "${RED}错误: 无法确定操作系统版本，缺少 /etc/os-release 文件。${PLAIN}"
-    exit 1
+    OS_ID="unknown"
+    OS_NAME="unknown Linux"
 fi
 
+ARCH_NAME="$(uname -m 2>/dev/null || echo unknown)"
 echo -e "${BLUE}==========================================================${PLAIN}"
 echo -e "${BLUE}        欢迎使用 eianun 二改版本 一键源码部署与管理脚本${PLAIN}"
 echo -e "${BLUE}==========================================================${PLAIN}"
+echo -e "  -> 当前系统: ${GREEN}${OS_NAME}${PLAIN} (${ARCH_NAME})"
+
+if ! command -v systemctl >/dev/null 2>&1; then
+    echo -e "${RED}错误: 当前系统未检测到 systemctl。此项目需要 systemd 管理服务。${PLAIN}"
+    exit 1
+fi
+
+detect_package_manager() {
+    if command -v apt-get >/dev/null 2>&1; then
+        echo "apt"
+    elif command -v dnf >/dev/null 2>&1; then
+        echo "dnf"
+    elif command -v yum >/dev/null 2>&1; then
+        echo "yum"
+    elif command -v pacman >/dev/null 2>&1; then
+        echo "pacman"
+    elif command -v zypper >/dev/null 2>&1; then
+        echo "zypper"
+    else
+        echo ""
+    fi
+}
+
+install_base_dependencies() {
+    PKG_MANAGER="$(detect_package_manager)"
+    if [ -z "$PKG_MANAGER" ]; then
+        echo -e "${RED}错误: 未检测到支持的包管理器。已支持 apt / dnf / yum / pacman / zypper。${PLAIN}"
+        exit 1
+    fi
+
+    echo -e "\n${YELLOW}[1/4] 正在安装系统基础依赖...${PLAIN}"
+    echo -e "  -> 检测到包管理器: ${GREEN}${PKG_MANAGER}${PLAIN}"
+
+    case "$PKG_MANAGER" in
+        apt)
+            echo -e "  -> 正在更新 APT 软件源..."
+            apt-get update -q || true
+            echo -e "  -> 正在安装依赖: openvpn curl git ca-certificates iptables iproute2 psmisc procps python3 iputils-ping"
+            apt-get install -y openvpn curl git ca-certificates iptables iproute2 psmisc procps python3 iputils-ping
+            ;;
+        dnf)
+            if [[ " ${ID_LIKE:-} ${OS_ID:-} " =~ (rhel|centos|fedora|rocky|almalinux|ol) ]]; then
+                echo -e "  -> RHEL 系发行版尝试启用 EPEL，便于安装 OpenVPN..."
+                dnf -y install epel-release || true
+            fi
+            echo -e "  -> 正在安装依赖: openvpn curl git ca-certificates iptables iproute procps-ng psmisc python3 iputils"
+            dnf -y install openvpn curl git ca-certificates iptables iproute procps-ng psmisc python3 iputils
+            ;;
+        yum)
+            if [[ " ${ID_LIKE:-} ${OS_ID:-} " =~ (rhel|centos|rocky|almalinux|ol) ]]; then
+                echo -e "  -> RHEL/CentOS 系发行版尝试启用 EPEL，便于安装 OpenVPN..."
+                yum -y install epel-release || true
+            fi
+            echo -e "  -> 正在安装依赖: openvpn curl git ca-certificates iptables iproute procps-ng psmisc python3 iputils"
+            yum -y install openvpn curl git ca-certificates iptables iproute procps-ng psmisc python3 iputils
+            ;;
+        pacman)
+            echo -e "  -> 正在同步并安装依赖: openvpn curl git ca-certificates iptables iproute2 procps-ng psmisc python iputils"
+            pacman -Sy --noconfirm --needed openvpn curl git ca-certificates iptables iproute2 procps-ng psmisc python iputils
+            ;;
+        zypper)
+            echo -e "  -> 正在刷新 Zypper 软件源..."
+            zypper --non-interactive refresh || true
+            echo -e "  -> 正在安装依赖: openvpn curl git ca-certificates iptables iproute2 procps psmisc python3 iputils"
+            zypper --non-interactive install -y openvpn curl git ca-certificates iptables iproute2 procps psmisc python3 iputils
+            ;;
+    esac
+}
+
+check_required_tools() {
+    PYTHON_BIN="$(command -v python3 || true)"
+    if [ -z "$PYTHON_BIN" ]; then
+        PYTHON_BIN="$(command -v python || true)"
+    fi
+    if [ -z "$PYTHON_BIN" ]; then
+        echo -e "${RED}错误: Python 未安装或不在 PATH 中。${PLAIN}"
+        exit 1
+    fi
+
+    missing=""
+    for cmd in openvpn curl git systemctl ip ping iptables pkill; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            missing="$missing $cmd"
+        fi
+    done
+    if [ -n "$missing" ]; then
+        echo -e "${RED}错误: 依赖工具仍缺失:${missing}${PLAIN}"
+        echo -e "${YELLOW}请检查发行版软件源是否可用；RHEL/CentOS/AlmaLinux/Rocky 若缺少 openvpn，请确认 EPEL 已启用。${PLAIN}"
+        exit 1
+    fi
+
+    echo -e "  -> 依赖检测通过: openvpn / curl / git / systemctl / ip / ping / iptables / pkill / Python"
+    echo -e "  -> Python: ${GREEN}${PYTHON_BIN}${PLAIN}"
+}
 
 # 3. Configure GitHub Repository URL
-# Default to the official repository (baoweise-bot/eianun-vpngate)
-DEFAULT_USER="eianun"
-DEFAULT_REPO="eianun-vpngate"
+# Default to your repository (illria/gatevpn)
+DEFAULT_USER="illria"
+DEFAULT_REPO="gatevpn"
 
 # Allow custom repository override via command line arguments
 GITHUB_USER="${1:-${DEFAULT_USER}}"
@@ -41,11 +134,8 @@ GITHUB_REPO="${2:-${DEFAULT_REPO}}"
 
 GITHUB_URL="https://github.com/${GITHUB_USER}/${GITHUB_REPO}.git"
 
-echo -e "\n${YELLOW}[1/4] 正在安装系统基础依赖...${PLAIN}"
-echo -e "  -> 正在运行 apt-get update 更新软件源清单..."
-apt-get update -q || true
-echo -e "  -> 正在运行 apt-get install 安装基础依赖包 (openvpn, curl, git, iptables, iproute2, psmisc, python3)..."
-apt-get install -y openvpn curl git ca-certificates iptables iproute2 psmisc python3
+install_base_dependencies
+check_required_tools
 
 # 4. Clone or pull the repository
 INSTALL_DIR="/opt/eianun-vpngate"
@@ -56,6 +146,11 @@ else
     if [ -d "${INSTALL_DIR}" ]; then
         echo -e "  -> 目录 ${INSTALL_DIR} 已存在，正在更新并强制覆盖本地源码..."
         cd "${INSTALL_DIR}"
+        if git remote get-url origin >/dev/null 2>&1; then
+            git remote set-url origin "${GITHUB_URL}" || true
+        else
+            git remote add origin "${GITHUB_URL}" || true
+        fi
         git fetch --all || true
         BRANCH="main"
         if git rev-parse --verify origin/main >/dev/null 2>&1; then
@@ -95,7 +190,7 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=${INSTALL_DIR}
-ExecStart=/usr/bin/python3 vpngate_manager.py
+ExecStart=${PYTHON_BIN} vpngate_manager.py
 Restart=always
 RestartSec=5
 EnvironmentFile=-/etc/default/eianun-vpngate
@@ -840,9 +935,9 @@ if [ ! -f "$AUTH_FILE" ]; then
     # Initialize defaults
     UI_PORT=8787
     # generate random secret suffix (12 chars alphanumeric)
-    SECRET_PATH=$(python3 -c "import random, string; print(''.join(random.choices(string.ascii_letters + string.digits, k=12)))")
+    SECRET_PATH=$(${PYTHON_BIN} -c "import random, string; print(''.join(random.choices(string.ascii_letters + string.digits, k=12)))")
     # generate random password
-    UI_PASSWORD=$(python3 -c "
+    UI_PASSWORD=$(${PYTHON_BIN} -c "
 import random, string
 chars = string.ascii_letters + string.digits
 while True:
@@ -851,7 +946,7 @@ while True:
         print(pwd)
         break
 ")
-    UI_USERNAME=$(python3 -c "
+    UI_USERNAME=$(${PYTHON_BIN} -c "
 import random, string
 chars = string.ascii_letters + string.digits
 while True:
@@ -917,7 +1012,7 @@ while True:
     TARGET_COUNTRIES_INPUT="${TARGET_COUNTRIES_INPUT:-}"
 
     # Write config JSON
-    python3 -c "
+    ${PYTHON_BIN} -c "
 import json
 cfg = {
     'host': '0.0.0.0',
@@ -942,9 +1037,9 @@ ACTIVE_ID=""
 LAST_MSG=""
 for i in {1..90}; do
     if [ -f "${INSTALL_DIR}/vpngate_data/state.json" ]; then
-        ACTIVE_ID=$(python3 -c "import json; print(json.load(open('${INSTALL_DIR}/vpngate_data/state.json')).get('active_openvpn_node_id', ''))" 2>/dev/null || echo "")
-        IS_CONN=$(python3 -c "import json; print(json.load(open('${INSTALL_DIR}/vpngate_data/state.json')).get('is_connecting', False))" 2>/dev/null || echo "False")
-        CUR_MSG=$(python3 -c "import json; print(json.load(open('${INSTALL_DIR}/vpngate_data/state.json')).get('last_check_message', ''))" 2>/dev/null || echo "")
+        ACTIVE_ID=$(${PYTHON_BIN} -c "import json; print(json.load(open('${INSTALL_DIR}/vpngate_data/state.json')).get('active_openvpn_node_id', ''))" 2>/dev/null || echo "")
+        IS_CONN=$(${PYTHON_BIN} -c "import json; print(json.load(open('${INSTALL_DIR}/vpngate_data/state.json')).get('is_connecting', False))" 2>/dev/null || echo "False")
+        CUR_MSG=$(${PYTHON_BIN} -c "import json; print(json.load(open('${INSTALL_DIR}/vpngate_data/state.json')).get('last_check_message', ''))" 2>/dev/null || echo "")
         
         if [ "$IS_CONN" = "False" ] || [ "$IS_CONN" = "false" ]; then
             if [ -n "$ACTIVE_ID" ]; then
@@ -977,10 +1072,10 @@ PASSWORD="未配置"
 UI_PORT=8787
 AUTH_FILE="${INSTALL_DIR}/vpngate_data/ui_auth.json"
 if [ -f "$AUTH_FILE" ]; then
-    SECRET_PATH=$(python3 -c "import json; print(json.load(open('$AUTH_FILE')).get('secret_path', 'EJsW2EeBo9lY'))" 2>/dev/null || echo "EJsW2EeBo9lY")
-    USERNAME=$(python3 -c "import json; print(json.load(open('$AUTH_FILE')).get('username', '未配置'))" 2>/dev/null || echo "未配置")
-    PASSWORD=$(python3 -c "import json; print(json.load(open('$AUTH_FILE')).get('password', '未配置'))" 2>/dev/null || echo "未配置")
-    UI_PORT=$(python3 -c "import json; print(json.load(open('$AUTH_FILE')).get('port', 8787))" 2>/dev/null || echo "8787")
+    SECRET_PATH=$(${PYTHON_BIN} -c "import json; print(json.load(open('$AUTH_FILE')).get('secret_path', 'EJsW2EeBo9lY'))" 2>/dev/null || echo "EJsW2EeBo9lY")
+    USERNAME=$(${PYTHON_BIN} -c "import json; print(json.load(open('$AUTH_FILE')).get('username', '未配置'))" 2>/dev/null || echo "未配置")
+    PASSWORD=$(${PYTHON_BIN} -c "import json; print(json.load(open('$AUTH_FILE')).get('password', '未配置'))" 2>/dev/null || echo "未配置")
+    UI_PORT=$(${PYTHON_BIN} -c "import json; print(json.load(open('$AUTH_FILE')).get('port', 8787))" 2>/dev/null || echo "8787")
 fi
 
 # Get VPS public IP

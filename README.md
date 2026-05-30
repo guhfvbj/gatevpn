@@ -9,20 +9,49 @@
 - 新增后端节点地区过滤：可只保留指定国家/地区的 VPNGate 节点，不再默认把全部地区节点都写入节点池。
 - Web 管理后台“管理员设置”新增 **拉取地区过滤** 输入框。
 - 安装后的命令行工具改为 `eianun`，同时保留 `ml` 兼容别名。
+- 安装脚本已适配主流 Linux 包管理器：APT、DNF、YUM、Pacman、Zypper。
+
+## 支持系统
+
+脚本会自动识别 `/etc/os-release` 和系统包管理器，并安装不同发行版对应的依赖包。
+
+已做适配的发行版族：
+
+- Debian / Ubuntu / Linux Mint 等 APT 系。
+- CentOS / RHEL / Rocky Linux / AlmaLinux / Oracle Linux 等 YUM 或 DNF 系。
+- Fedora 等 DNF 系。
+- Arch Linux / Manjaro 等 Pacman 系。
+- openSUSE / SUSE 等 Zypper 系。
+
+注意：本项目仍依赖 **systemd** 管理后台服务。如果系统没有 `systemctl`，安装脚本会直接提示不支持。
 
 ## 快速安装
 
-上传到你自己的 GitHub 仓库后，把下面命令里的 `eianun/eianun-vpngate` 换成你的仓库地址：
+你的仓库地址是：`https://github.com/illria/gatevpn`
+
+上传文件到该仓库后，使用下面命令安装：
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/eianun/eianun-vpngate/main/install.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/illria/gatevpn/main/install.sh)
 ```
 
 也可以在安装时指定仓库用户和仓库名：
 
 ```bash
-bash install.sh your-github-user your-repo-name
+bash install.sh illria gatevpn
 ```
+
+## 安装脚本依赖检测
+
+安装脚本会自动执行：
+
+1. 检测 root 权限。
+2. 检测 systemd / `systemctl`。
+3. 检测包管理器：`apt-get`、`dnf`、`yum`、`pacman`、`zypper`。
+4. 根据发行版安装依赖：`openvpn`、`curl`、`git`、`ca-certificates`、`iptables`、`iproute/iproute2`、`procps/procps-ng`、`psmisc`、`python3/python`、`iputils/iputils-ping`。
+5. 安装后再次检测必要工具：`openvpn`、`curl`、`git`、`systemctl`、`ip`、`ping`、`iptables`、`pkill`、`Python`。
+
+RHEL / CentOS / Rocky / AlmaLinux 等系统会尝试自动安装 `epel-release`，方便安装 OpenVPN。如果你的镜像源没有 EPEL，需要先手动启用 EPEL。
 
 ## 指定地区拉取节点
 
