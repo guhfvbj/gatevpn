@@ -51,6 +51,9 @@ INVALID_BACKOFF_SECONDS = int(os.environ.get("INVALID_BACKOFF_SECONDS", str(30 *
 # 1 = 手动选择某个地区节点后，故障转移只在同地区内切换；0 = 同地区无可用时允许跨地区兜底。
 STRICT_COUNTRY_FAILOVER = os.environ.get("STRICT_COUNTRY_FAILOVER", "1").strip().lower() not in {"0", "false", "no", "off"}
 TARGET_COUNTRIES_ENV = os.environ.get("VPNGATE_TARGET_COUNTRIES") or os.environ.get("TARGET_COUNTRIES") or os.environ.get("TARGET_COUNTRY") or ""
+# 风控策略：默认只自动连接无黑名单命中、欺诈值较低的干净 IP。
+MAX_AUTO_FRAUD_SCORE = int(os.environ.get("MAX_AUTO_FRAUD_SCORE", "25"))
+ALLOW_RISKY_IP_CONNECT = os.environ.get("ALLOW_RISKY_IP_CONNECT", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ["VPNGATE_DATA_DIR"]).resolve() if os.environ.get("VPNGATE_DATA_DIR") else ROOT_DIR / "vpngate_data"
@@ -268,27 +271,66 @@ def node_matches_target_countries(node: dict[str, Any], targets: list[str]) -> b
             return True
     return False
 
+def node_has_risk_data(node: dict[str, Any]) -> bool:
+    risk_level = str(node.get("risk_level") or "").lower()
+    return bool(
+        risk_level in {"clean", "low", "medium", "high", "blocked"}
+        or node.get("risk_sources")
+        or node.get("fraud_flags")
+        or node.get("blacklist_hits")
+    )
+
+def node_fraud_score(node: dict[str, Any], unknown: int = 50) -> int:
+    val = node.get("fraud_score")
+    if val in (None, ""):
+        return unknown
+    return parse_int(val)
+
+def node_is_clean_for_connect(node: dict[str, Any]) -> bool:
+    if ALLOW_RISKY_IP_CONNECT:
+        return True
+    if not node_has_risk_data(node):
+        return False
+    if parse_int(node.get("blacklist_count")) > 0:
+        return False
+    if node_fraud_score(node, unknown=100) > MAX_AUTO_FRAUD_SCORE:
+        return False
+    if str(node.get("risk_level") or "").lower() in {"medium", "high", "blocked"}:
+        return False
+    if str(node.get("ip_type") or "").lower() in {"proxy", "hosting", "tor"}:
+        return False
+    return True
+
 def node_ip_priority_rank(node: dict[str, Any]) -> int:
-    """Lower is better. Prefer residential exit IPs during sorting and failover."""
+    """Lower is better. Prefer clean residential IPs; deprioritize risky or blacklisted IPs."""
     ip_type = str(node.get("ip_type") or "").strip().lower()
     quality = str(node.get("quality") or "").strip().lower()
-    if ip_type == "residential" and quality in {"", "normal", "residential"}:
+    risk_level = str(node.get("risk_level") or "").strip().lower()
+    blacklist_count = parse_int(node.get("blacklist_count"))
+    fraud_score = node_fraud_score(node, unknown=50)
+
+    if blacklist_count > 0 or risk_level in {"high", "blocked"}:
+        return 99
+    if fraud_score > MAX_AUTO_FRAUD_SCORE and not ALLOW_RISKY_IP_CONNECT:
+        return 90
+    if ip_type == "residential" and quality in {"clean_residential", "", "normal", "residential"} and risk_level in {"clean", ""}:
         return 0
     if ip_type == "residential":
         return 1
     if ip_type == "mobile" or quality == "mobile":
         return 2
     if quality in {"", "normal"} and ip_type in {"", "unknown"}:
-        return 3
-    if ip_type == "hosting" or quality in {"hosting", "datacenter"}:
-        return 4
-    if ip_type == "proxy" or quality == "proxy":
         return 5
+    if ip_type == "hosting" or quality in {"hosting", "datacenter"}:
+        return 8
+    if ip_type in {"proxy", "tor"} or quality in {"proxy", "risky"}:
+        return 9
     return 6
 
-def node_sort_key(node: dict[str, Any]) -> tuple[int, int, int, int]:
+def node_sort_key(node: dict[str, Any]) -> tuple[int, int, int, int, int]:
     return (
         node_ip_priority_rank(node),
+        node_fraud_score(node, unknown=50),
         parse_int(node.get("latency_ms")) or 999999,
         parse_int(node.get("ping")) or 999999,
         -parse_int(node.get("score")),
@@ -399,6 +441,8 @@ def get_state() -> dict[str, Any]:
     state.setdefault("failover_country", "")
     state.setdefault("failover_country_display", target_countries or "未固定")
     state["strict_country_failover"] = STRICT_COUNTRY_FAILOVER
+    state["max_auto_fraud_score"] = MAX_AUTO_FRAUD_SCORE
+    state["allow_risky_ip_connect"] = ALLOW_RISKY_IP_CONNECT
     
     return state
 
@@ -463,6 +507,14 @@ def row_to_node(row: dict[str, str], config_text: str) -> dict[str, Any]:
         "location": "",
         "ip_type": "",
         "quality": "",
+        "fraud_score": 0,
+        "clean_score": 0,
+        "risk_level": "unknown",
+        "fraud_flags": [],
+        "risk_sources": [],
+        "blacklist_hits": [],
+        "blacklist_count": 0,
+        "ip_clean": False,
         "latency_ms": 0,
         "config_file": str(config_path),
         "config_text": config_text,
@@ -850,6 +902,14 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
         "location": "",
         "ip_type": "",
         "quality": "",
+        "fraud_score": 0,
+        "clean_score": 0,
+        "risk_level": "unknown",
+        "fraud_flags": [],
+        "risk_sources": [],
+        "blacklist_hits": [],
+        "blacklist_count": 0,
+        "ip_clean": False,
     }
     if ok:
         vpn_utils.enrich_ip_info([temp_node])
@@ -869,6 +929,8 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
                 node["location"] = temp_node["location"]
                 node["ip_type"] = temp_node["ip_type"]
                 node["quality"] = temp_node["quality"]
+                for risk_key in ["fraud_score", "clean_score", "risk_level", "fraud_flags", "risk_sources", "blacklist_hits", "blacklist_count", "ip_clean"]:
+                    node[risk_key] = temp_node.get(risk_key, [] if risk_key.endswith("hits") or risk_key.endswith("flags") or risk_key.endswith("sources") else False if risk_key == "ip_clean" else 0)
             
             sorted_nodes = sort_all_nodes(nodes)
             write_json(NODES_FILE, sorted_nodes)
@@ -920,6 +982,14 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
             "location": "",
             "ip_type": "",
             "quality": "",
+            "fraud_score": 0,
+            "clean_score": 0,
+            "risk_level": "unknown",
+            "fraud_flags": [],
+            "risk_sources": [],
+            "blacklist_hits": [],
+            "blacklist_count": 0,
+            "ip_clean": False,
         }
         if ok:
             ip_to_enrich = {
@@ -931,6 +1001,14 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
                 "location": "",
                 "ip_type": "",
                 "quality": "",
+                "fraud_score": 0,
+                "clean_score": 0,
+                "risk_level": "unknown",
+                "fraud_flags": [],
+                "risk_sources": [],
+                "blacklist_hits": [],
+                "blacklist_count": 0,
+                "ip_clean": False,
             }
             vpn_utils.enrich_ip_info([ip_to_enrich])
             temp_node.update(ip_to_enrich)
@@ -979,16 +1057,18 @@ def auto_switch_node(attempt: int = 0) -> None:
             and not n.get("active")
         ]
         scoped_candidates = [n for n in all_candidates if node_matches_target_countries(n, failover_targets)] if failover_targets else all_candidates
-        candidates = scoped_candidates
+        clean_scoped_candidates = [n for n in scoped_candidates if node_is_clean_for_connect(n)]
+        clean_all_candidates = [n for n in all_candidates if node_is_clean_for_connect(n)]
+        candidates = clean_scoped_candidates
         if not candidates and not STRICT_COUNTRY_FAILOVER:
-            candidates = all_candidates
+            candidates = clean_all_candidates
         candidates.sort(key=node_sort_key)
         scope_display = normalize_target_countries_input(failover_targets) if failover_targets else "全部地区"
         
     if candidates:
         next_node = candidates[0]
-        ip_kind = "住宅IP优先" if node_ip_priority_rank(next_node) == 0 else "可用IP兜底"
-        msg = f"当前连接已失效或代理连通性检测失败，正在按固定地区 {scope_display} 自动切换至备用节点: {next_node['id']} ({ip_kind})"
+        ip_kind = f"干净度 {next_node.get('clean_score', 0)} / 欺诈值 {next_node.get('fraud_score', 0)}"
+        msg = f"当前连接已失效或代理连通性检测失败，正在按固定地区 {scope_display} 自动切换至干净备用节点: {next_node['id']} ({ip_kind})"
         print(f"[自动切换] {msg}", flush=True)
         log_to_json("INFO", "VPN", msg)
         try:
@@ -1000,7 +1080,7 @@ def auto_switch_node(attempt: int = 0) -> None:
             auto_switch_node(attempt + 1)
     else:
         if failover_targets:
-            msg = f"固定地区 {scope_display} 当前没有可用备用节点，将清理当前连接并后台拉取同地区新节点..."
+            msg = f"固定地区 {scope_display} 当前没有通过风控的干净备用节点，将清理当前连接并后台拉取同地区新节点..."
         else:
             msg = "没有可用的备选节点，将自动断开并清理当前连接状态，同时在后台异步获取新节点..."
         print(f"[自动切换] {msg}", flush=True)
@@ -1038,6 +1118,12 @@ def connect_node(node_id: str, update_failover_scope: bool = True) -> str:
         node = next((item for item in nodes if item.get("id") == node_id), None)
         if not node:
             raise ValueError(f"Node not found: {node_id}")
+        if not node_is_clean_for_connect(node):
+            reason = f"该节点未通过 IP 风控：欺诈值 {node.get('fraud_score', '未知')}，黑名单命中 {node.get('blacklist_count', 0)}，风险等级 {node.get('risk_level', 'unknown')}。请先检测节点，或降低 MAX_AUTO_FRAUD_SCORE/开启 ALLOW_RISKY_IP_CONNECT。"
+            set_state(active_openvpn_node_id="", is_connecting=False, active_node_latency="已阻止", last_check_message=reason)
+            with lock:
+                active_openvpn_node_id = ""
+            raise RuntimeError(reason)
         
         set_state(active_node_latency="清理连接", last_check_message="正在关闭与清理旧的 VPN 连接及网卡...")
         stop_active_openvpn()
@@ -1201,7 +1287,7 @@ def maintain_valid_nodes(force: bool = False, target_override: list[str] | None 
         with lock:
             merged = read_json(NODES_FILE, [])
             if not active_openvpn_running():
-                available_candidates = [n for n in merged if n.get("probe_status") == "available"]
+                available_candidates = [n for n in merged if n.get("probe_status") == "available" and node_is_clean_for_connect(n)]
                 if available_candidates:
                     auto_switch_node()
 
@@ -2441,6 +2527,8 @@ INDEX_HTML = r"""<!doctype html>
             <th>运营主体 / ISP</th>
             <th style="width: 110px;">网络质量</th>
             <th style="width: 110px;">IP 类型</th>
+            <th style="width: 100px;">欺诈值</th>
+            <th style="width: 110px;">黑名单</th>
             <th style="width: 160px;">操作</th>
           </tr>
         </thead>
@@ -2547,14 +2635,54 @@ function time(ts){return ts?new Date(ts*1000).toLocaleString():"从未"}
 function speed(v){return v?`${(v*8/1000/1000).toFixed(1)} Mbps`:"-"}
 
 const translateQuality = q => {
-  const dict = {"normal": "普通", "proxy": "代理", "datacenter": "数据中心", "mobile": "移动端"};
+  const dict = {"clean_residential": "干净住宅", "normal": "普通", "proxy": "代理", "datacenter": "数据中心", "mobile": "移动端", "risky": "高风险"};
   return dict[q] || q || "-";
 };
 
 const translateIpType = t => {
-  const dict = {"residential": "住宅 IP", "hosting": "机房 IP", "mobile": "移动网", "proxy": "代理 IP"};
+  const dict = {"residential": "住宅 IP", "hosting": "机房 IP", "mobile": "移动网", "proxy": "代理 IP", "tor": "Tor 出口"};
   return dict[t] || t || "-";
 };
+
+const translateRiskLevel = r => {
+  const dict = {"clean": "干净", "low": "低风险", "medium": "中风险", "high": "高风险", "unknown": "未检测"};
+  return dict[r] || r || "未检测";
+};
+
+function isCleanNode(n) {
+  if (state.allow_risky_ip_connect) return true;
+  const riskLevel = String(n.risk_level || "unknown").toLowerCase();
+  const ipType = String(n.ip_type || "").toLowerCase();
+  const fraudScore = Number(n.fraud_score ?? 100);
+  const maxScore = Number(state.max_auto_fraud_score ?? 25);
+  const blacklistCount = Number(n.blacklist_count || 0);
+  if (riskLevel === "unknown" || !n.risk_sources) return false;
+  if (blacklistCount > 0) return false;
+  if (fraudScore > maxScore) return false;
+  if (["medium", "high", "blocked"].includes(riskLevel)) return false;
+  if (["proxy", "hosting", "tor"].includes(ipType)) return false;
+  return true;
+}
+
+function riskBadge(n) {
+  const score = Number(n.fraud_score ?? 0);
+  const clean = Number(n.clean_score ?? Math.max(0, 100 - score));
+  const level = String(n.risk_level || "unknown").toLowerCase();
+  const hits = Number(n.blacklist_count || 0);
+  const title = [
+    `风险等级: ${translateRiskLevel(level)}`,
+    `干净度: ${clean}`,
+    `欺诈值: ${score}`,
+    `检测源: ${(n.risk_sources || []).join(", ") || "未检测"}`,
+    `风险标记: ${(n.fraud_flags || []).join(", ") || "无"}`
+  ].join("\n");
+  let cls = "not_checked";
+  if (hits > 0 || level === "high") cls = "unavailable";
+  else if (level === "clean") cls = "available";
+  else if (level === "low") cls = "not_checked";
+  else if (level === "medium") cls = "unavailable";
+  return `<span class="badge ${cls}" title="${esc(title)}">${score}</span>`;
+}
 
 const translateCountry = c => {
   const dict = {
@@ -2668,7 +2796,9 @@ function getFilteredNodes() {
     }
     const searchStr = [
       n.country, n.country_short, n.ip, n.remote_host, n.proto,
-      translateQuality(n.quality), translateIpType(n.ip_type), n.location, n.owner, n.as_name
+      translateQuality(n.quality), translateIpType(n.ip_type), translateRiskLevel(n.risk_level),
+      n.location, n.owner, n.as_name, n.fraud_score, n.clean_score,
+      (n.fraud_flags || []).join(" "), (n.blacklist_hits || []).join(" ")
     ].join(" ").toLowerCase();
     return searchStr.includes(q);
   });
@@ -2731,6 +2861,7 @@ function render(){
               <span style="margin-left: 12px;">延时: <strong>${latencyText}</strong></span>
               <span style="margin-left: 12px;">运营主体: <strong>${esc(activeNode.owner || activeNode.as_name || "-")}</strong></span>
               <span style="margin-left: 12px;">IP 类型: <strong>${esc(translateIpType(activeNode.ip_type))}</strong></span>
+              <span style="margin-left: 12px;">风控: <strong>${esc(translateRiskLevel(activeNode.risk_level))}</strong> / 欺诈值 <strong>${esc(activeNode.fraud_score ?? "-")}</strong></span>
             </div>
           </div>
         </div>
@@ -2836,7 +2967,7 @@ function render(){
 
   // Render table rows
   if (currentPageNodes.length === 0) {
-    $("rows").innerHTML = `<tr><td colspan="9" style="text-align: center; color: var(--text-secondary); padding: 40px 0;">未找到符合过滤条件的备选节点。</td></tr>`;
+    $("rows").innerHTML = `<tr><td colspan="11" style="text-align: center; color: var(--text-secondary); padding: 40px 0;">未找到符合过滤条件的备选节点。</td></tr>`;
   } else {
     $("rows").innerHTML=currentPageNodes.map(n=>{
       const isCurrentlyActive = activeNode && n.id === activeNode.id;
@@ -2853,11 +2984,17 @@ function render(){
       const testBtnText = isTesting ? `${testSpinner}检测中` : '检测';
       const testBtn = `<button class="test-btn" data-node-id="${esc(n.id)}" ${isTesting ? 'disabled' : ''} onclick="testNode(this, '${esc(n.id)}', event)">${testBtnText}</button>`;
       
-      // Connect button is disabled if probe status is "unavailable" and not already active, or if we are already connecting
+      // Only clean, tested nodes are allowed to connect by default.
       const isUnavailable = n.probe_status === "unavailable";
+      const isUnknown = n.probe_status !== "available";
+      const cleanOk = isCleanNode(n);
+      let blockReason = "";
+      if (isUnknown) blockReason = "请先检测节点，通过 OpenVPN 握手和 IP 风控后才能切换";
+      else if (!cleanOk) blockReason = `IP 风控未通过：${translateRiskLevel(n.risk_level)}，欺诈值 ${n.fraud_score ?? "未知"}，黑名单 ${n.blacklist_count || 0}`;
+      const disableConnect = isUnavailable || isUnknown || state.is_connecting || !cleanOk;
       const connectBtn = isCurrentlyActive 
         ? `<button class="connect-btn" disabled style="background: var(--success-gradient); color: white; cursor: default; opacity: 1;">已连接</button>`
-        : `<button class="connect-btn" ${(isUnavailable || state.is_connecting) ? 'disabled style="opacity:0.3; cursor:not-allowed;"' : ''} onclick="connectNode('${esc(n.id)}')">切换</button>`;
+        : `<button class="connect-btn" ${disableConnect ? `disabled title="${esc(blockReason || "当前不可切换")}" style="opacity:0.3; cursor:not-allowed;"` : ''} onclick="connectNode('${esc(n.id)}')">${cleanOk ? "切换" : "需检测"}</button>`;
       
       return `<tr ${rowClass}>
         <td><span class="badge ${badgeClass}">${badgeText}</span></td>
@@ -2868,6 +3005,8 @@ function render(){
         <td>${esc(n.owner||n.as_name||"-")}</td>
         <td>${esc(translateQuality(n.quality))}</td>
         <td>${esc(translateIpType(n.ip_type))}</td>
+        <td>${riskBadge(n)}</td>
+        <td><span class="badge ${Number(n.blacklist_count || 0) > 0 ? 'unavailable' : (n.risk_level === 'unknown' ? 'not_checked' : 'available')}" title="${esc((n.blacklist_hits || []).join(', ') || '无命中')}">${Number(n.blacklist_count || 0) > 0 ? '命中 ' + Number(n.blacklist_count || 0) : (n.risk_level === 'unknown' ? '未检' : '干净')}</span></td>
         <td>
           <div class="table-actions">
             ${testBtn}

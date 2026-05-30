@@ -153,3 +153,54 @@ eianun uninstall   # 卸载
 | Void Linux | xbps | runit |
 
 说明：脚本尽量覆盖主流 Linux，但“全部 Linux”里存在大量极简镜像、容器镜像、非标准服务管理器或缺少 TUN/OpenVPN 内核能力的环境。遇到这类系统时，脚本会提示缺失项，而不是静默失败。
+
+---
+
+### 🛡️ 多源 IP 风控与干净度评分
+
+新版内置多源 IP 风控评分，节点检测通过 OpenVPN 握手后，会继续对入口 IP 做多维度质量检查，用于自动排序、手动切换限制和故障转移选择。
+
+默认检测维度：
+
+- `ip-api.com`：地区、ASN、ISP、proxy、hosting、mobile 标记。
+- `ipwho.is`：ASN/运营主体与 proxy/vpn/tor/hosting 安全标记。
+- `proxycheck.io`：代理/VPN 类型与第三方 risk 分数。
+- DNSBL 黑名单：默认检查 `zen.spamhaus.org`、`bl.spamcop.net`、`dnsbl.sorbs.net`、`all.s5h.net`。
+- ASN/运营主体关键词：自动识别 VPS、云厂商、数据中心、代理、VPN、托管网络等关键词。
+
+面板会显示：
+
+- IP 类型：住宅 IP / 移动网 / 机房 IP / 代理 IP / Tor 出口。
+- 网络质量：干净住宅 / 普通 / 数据中心 / 代理 / 移动端 / 高风险。
+- 欺诈值：0-100，越低越干净。
+- 黑名单：命中数量与具体 DNSBL 来源。
+
+默认策略：
+
+- 只允许自动连接 `欺诈值 <= 25` 且无黑名单命中的节点。
+- 自动故障转移只会选择通过风控的干净备用节点。
+- 未检测节点、黑名单命中节点、中高风险节点默认不允许切换。
+
+可选环境变量：
+
+```bash
+# 自动连接允许的最高欺诈值，默认 25
+MAX_AUTO_FRAUD_SCORE=25
+
+# 是否允许手动/自动连接风险节点，默认关闭，不建议开启
+ALLOW_RISKY_IP_CONNECT=0
+
+# 是否启用 DNSBL 黑名单检测，默认开启
+IP_DNSBL_CHECK=1
+
+# 是否启用 ipwho.is 检测，默认开启
+IPWHOIS_CHECK=1
+
+# 是否启用 proxycheck.io 检测，默认开启
+PROXYCHECK_CHECK=1
+
+# 风控缓存有效期，默认 24 小时
+IP_RISK_CACHE_TTL_SECONDS=86400
+```
+
+如需修改，在 `/etc/default/eianun-vpngate` 中写入对应变量后重启服务。

@@ -321,35 +321,271 @@ def save_ip_cache(cache: dict[str, dict[str, Any]]) -> None:
         except Exception:
             pass
 
+
+SUSPICIOUS_ASN_KEYWORDS = {
+    "hosting", "host", "cloud", "vps", "server", "servers", "data center", "datacenter",
+    "colo", "colocation", "dedicated", "virtual", "vpn", "proxy", "relay", "tor", "privacy",
+    "digitalocean", "hetzner", "ovh", "aws", "amazon", "google cloud", "microsoft", "azure",
+    "oracle", "linode", "akamai", "vultr", "contabo", "leaseweb", "m247", "choopa",
+    "quadranet", "colo cross", "cogent", "sharktech", "psychz", "dedipath", "gcore",
+}
+
+DNSBL_ZONES = [
+    "zen.spamhaus.org",
+    "bl.spamcop.net",
+    "dnsbl.sorbs.net",
+    "all.s5h.net",
+]
+
+def env_bool(name: str, default: bool = True) -> bool:
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return val.strip().lower() not in {"0", "false", "no", "off"}
+
+def parse_asn_number(value: Any) -> str:
+    text = str(value or "")
+    match = re.search(r"AS\s*([0-9]+)", text, re.I)
+    if match:
+        return "AS" + match.group(1)
+    match = re.search(r"\b([0-9]{2,})\b", text)
+    return "AS" + match.group(1) if match else ""
+
+def safe_json_request(url: str, timeout: float = 7.0) -> dict[str, Any]:
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "eianun-ip-risk/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+            data = json.loads(raw)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def dnsbl_hits(ip: str, timeout: float = 1.2) -> list[str]:
+    if not env_bool("IP_DNSBL_CHECK", True):
+        return []
+    try:
+        socket.inet_aton(ip)
+    except OSError:
+        return []
+    reversed_ip = ".".join(reversed(ip.split(".")))
+    hits: list[str] = []
+    old_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(timeout)
+    try:
+        for zone in DNSBL_ZONES:
+            query = f"{reversed_ip}.{zone}"
+            try:
+                socket.gethostbyname(query)
+                hits.append(zone)
+            except Exception:
+                pass
+    finally:
+        socket.setdefaulttimeout(old_timeout)
+    return hits
+
+def query_ipwhois(ip: str) -> dict[str, Any]:
+    data = safe_json_request(f"http://ipwho.is/{urllib.parse.quote(ip)}?security=1", timeout=7)
+    if not data or data.get("success") is False:
+        return {}
+    connection = data.get("connection") or {}
+    security = data.get("security") or {}
+    loc = " ".join(str(x) for x in [data.get("country"), data.get("region"), data.get("city")] if x)
+    return {
+        "source": "ipwho.is",
+        "asn": parse_asn_number(connection.get("asn")),
+        "as_name": connection.get("org") or connection.get("isp") or "",
+        "owner": connection.get("isp") or connection.get("org") or "",
+        "location": loc,
+        "proxy": bool(security.get("proxy") or security.get("anonymous")),
+        "vpn": bool(security.get("vpn")),
+        "tor": bool(security.get("tor")),
+        "hosting": bool(security.get("hosting")),
+    }
+
+def query_proxycheck(ip: str) -> dict[str, Any]:
+    data = safe_json_request(f"http://proxycheck.io/v2/{urllib.parse.quote(ip)}?vpn=1&asn=1&risk=1&node=1&tag=eianun", timeout=8)
+    item = data.get(ip) if isinstance(data, dict) else None
+    if not isinstance(item, dict):
+        return {}
+    risk_raw = item.get("risk")
+    try:
+        risk = int(float(risk_raw))
+    except Exception:
+        risk = 0
+    proxy_yes = str(item.get("proxy", "")).lower() == "yes"
+    type_text = str(item.get("type") or "").lower()
+    return {
+        "source": "proxycheck.io",
+        "asn": parse_asn_number(item.get("asn")),
+        "as_name": item.get("provider") or item.get("organisation") or "",
+        "owner": item.get("provider") or item.get("organisation") or "",
+        "proxy": proxy_yes,
+        "vpn": proxy_yes and "vpn" in type_text,
+        "tor": proxy_yes and "tor" in type_text,
+        "hosting": any(k in type_text for k in ["hosting", "server", "datacenter", "data center"]),
+        "risk": risk,
+        "type": item.get("type") or "",
+    }
+
+def build_risk_profile(ip: str, ipapi_item: dict[str, Any] | None = None) -> dict[str, Any]:
+    now = time.time()
+    flags: list[str] = []
+    sources: list[str] = []
+    blacklist = dnsbl_hits(ip)
+    owner = ""
+    asn = ""
+    as_name = ""
+    location = ""
+    proxy = False
+    hosting = False
+    mobile = False
+    vpn = False
+    tor = False
+    external_risks: list[int] = []
+
+    if ipapi_item:
+        sources.append("ip-api.com")
+        owner = ipapi_item.get("org") or ipapi_item.get("isp") or owner
+        asn = ipapi_item.get("as") or asn
+        as_name = ipapi_item.get("asname") or as_name
+        location = " ".join(part for part in [ipapi_item.get("country"), ipapi_item.get("regionName"), ipapi_item.get("city")] if part)
+        proxy = proxy or bool(ipapi_item.get("proxy"))
+        hosting = hosting or bool(ipapi_item.get("hosting"))
+        mobile = mobile or bool(ipapi_item.get("mobile"))
+
+    if env_bool("IPWHOIS_CHECK", True):
+        info = query_ipwhois(ip)
+        if info:
+            sources.append(info.get("source", "ipwho.is"))
+            owner = owner or info.get("owner", "")
+            asn = asn or info.get("asn", "")
+            as_name = as_name or info.get("as_name", "")
+            location = location or info.get("location", "")
+            proxy = proxy or bool(info.get("proxy"))
+            hosting = hosting or bool(info.get("hosting"))
+            vpn = vpn or bool(info.get("vpn"))
+            tor = tor or bool(info.get("tor"))
+
+    if env_bool("PROXYCHECK_CHECK", True):
+        info = query_proxycheck(ip)
+        if info:
+            sources.append(info.get("source", "proxycheck.io"))
+            owner = owner or info.get("owner", "")
+            asn = asn or info.get("asn", "")
+            as_name = as_name or info.get("as_name", "")
+            proxy = proxy or bool(info.get("proxy"))
+            hosting = hosting or bool(info.get("hosting"))
+            vpn = vpn or bool(info.get("vpn"))
+            tor = tor or bool(info.get("tor"))
+            if info.get("risk"):
+                external_risks.append(int(info.get("risk", 0)))
+
+    text_blob = " ".join([owner, as_name, asn]).lower()
+    suspicious_asn = any(k in text_blob for k in SUSPICIOUS_ASN_KEYWORDS)
+
+    score = 0
+    if tor:
+        score += 80
+        flags.append("tor_exit")
+    if proxy:
+        score += 55
+        flags.append("proxy_flag")
+    if vpn:
+        score += 45
+        flags.append("vpn_flag")
+    if hosting:
+        score += 38
+        flags.append("hosting_datacenter")
+    if suspicious_asn:
+        score += 25
+        flags.append("suspicious_asn_keyword")
+    if mobile:
+        score += 8
+        flags.append("mobile_network")
+    if blacklist:
+        score += min(65, 30 + 12 * (len(blacklist) - 1))
+        flags.append("dnsbl_blacklist")
+    if external_risks:
+        score += max(external_risks) // 2
+        flags.append("third_party_risk_score")
+
+    score = max(0, min(100, score))
+    clean_score = max(0, 100 - score)
+
+    if blacklist or tor or score >= 70:
+        risk_level = "high"
+    elif score >= 40:
+        risk_level = "medium"
+    elif score >= 20:
+        risk_level = "low"
+    else:
+        risk_level = "clean"
+
+    if tor:
+        ip_type = "tor"
+        quality = "risky"
+    elif proxy or vpn:
+        ip_type = "proxy"
+        quality = "proxy"
+    elif hosting or suspicious_asn:
+        ip_type = "hosting"
+        quality = "datacenter"
+    elif mobile:
+        ip_type = "mobile"
+        quality = "mobile"
+    else:
+        ip_type = "residential"
+        quality = "clean_residential" if risk_level == "clean" else "normal"
+
+    return {
+        "owner": owner,
+        "asn": asn,
+        "as_name": as_name,
+        "location": location,
+        "ip_type": ip_type,
+        "quality": quality,
+        "fraud_score": score,
+        "clean_score": clean_score,
+        "risk_level": risk_level,
+        "fraud_flags": flags,
+        "risk_sources": sorted(set(sources + (["dnsbl"] if blacklist else []))),
+        "blacklist_hits": blacklist,
+        "blacklist_count": len(blacklist),
+        "ip_clean": bool(risk_level == "clean" and not blacklist and ip_type == "residential"),
+        "cached_at": now,
+    }
+
+def apply_ip_profile(node: dict[str, Any], profile: dict[str, Any]) -> None:
+    for key in [
+        "owner", "asn", "as_name", "location", "ip_type", "quality", "fraud_score",
+        "clean_score", "risk_level", "fraud_flags", "risk_sources", "blacklist_hits",
+        "blacklist_count", "ip_clean",
+    ]:
+        node[key] = profile.get(key, [] if key.endswith("hits") or key.endswith("flags") or key.endswith("sources") else "" if key in {"owner", "asn", "as_name", "location", "ip_type", "quality", "risk_level"} else 0)
+
 def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
-    # 1. Read cache thread-safely
     with ip_cache_lock:
         cache = load_ip_cache()
 
-    ips_to_query = []
+    ips_to_query: list[str] = []
     now = time.time()
+    cache_ttl = int(os.environ.get("IP_RISK_CACHE_TTL_SECONDS", str(24 * 3600)))
 
     for node in nodes:
         ip = node.get("ip") or node.get("remote_host")
         if not ip:
             continue
-        if ip in cache and now - cache[ip].get("cached_at", 0) < 7 * 24 * 3600:
-            cached = cache[ip]
-            node["owner"] = cached.get("owner", "")
-            node["asn"] = cached.get("asn", "")
-            node["as_name"] = cached.get("as_name", "")
-            node["location"] = cached.get("location", "")
-            node["ip_type"] = cached.get("ip_type", "")
-            node["quality"] = cached.get("quality", "")
-        else:
-            if ip not in ips_to_query:
-                ips_to_query.append(ip)
+        cached = cache.get(ip)
+        if cached and now - cached.get("cached_at", 0) < cache_ttl:
+            apply_ip_profile(node, cached)
+        elif ip not in ips_to_query:
+            ips_to_query.append(ip)
 
     if not ips_to_query:
         return
 
-    # 2. Perform HTTP query outside lock
-    new_entries = {}
+    ipapi_items: dict[str, dict[str, Any]] = {}
     chunk_size = 100
     for i in range(0, len(ips_to_query), chunk_size):
         chunk = ips_to_query[i : i + chunk_size]
@@ -357,66 +593,52 @@ def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
         request = urllib.request.Request(
             "http://ip-api.com/batch?lang=zh-CN&fields=status,message,query,country,regionName,city,isp,org,as,asname,proxy,hosting,mobile",
             data=payload,
-            headers={"Content-Type": "application/json", "User-Agent": "vpngate-manager/2.2"},
+            headers={"Content-Type": "application/json", "User-Agent": "eianun-ip-risk/1.0"},
             method="POST",
         )
         try:
             with urllib.request.urlopen(request, timeout=15) as response:
                 data = json.loads(response.read().decode("utf-8", errors="replace"))
-                for item in data:
-                    if item.get("status") != "success":
-                        continue
-                    query_ip = item.get("query")
-                    if not query_ip:
-                        continue
-
-                    ip_type = "residential"
-                    if item.get("mobile"):
-                        ip_type = "mobile"
-                    elif item.get("proxy"):
-                        ip_type = "proxy"
-                    elif item.get("hosting"):
-                        ip_type = "hosting"
-
-                    quality = "normal"
-                    if item.get("proxy"):
-                        quality = "proxy"
-                    elif item.get("hosting"):
-                        quality = "datacenter"
-                    elif item.get("mobile"):
-                        quality = "mobile"
-
-                    loc = " ".join(part for part in [item.get("country"), item.get("regionName"), item.get("city")] if part)
-
-                    new_entries[query_ip] = {
-                        "owner": item.get("org") or item.get("isp") or "",
-                        "asn": item.get("as") or "",
-                        "as_name": item.get("asname") or "",
-                        "location": loc,
-                        "ip_type": ip_type,
-                        "quality": quality,
-                        "cached_at": now,
-                    }
+                if isinstance(data, list):
+                    for item in data:
+                        if isinstance(item, dict) and item.get("status") == "success" and item.get("query"):
+                            ipapi_items[item["query"]] = item
         except Exception as e:
-            print(f"[enrich_ip_info] Query failed: {e}", flush=True)
+            print(f"[enrich_ip_info] ip-api query failed: {e}", flush=True)
+
+    new_entries: dict[str, dict[str, Any]] = {}
+    max_workers = max(1, min(8, int(os.environ.get("IP_RISK_CHECK_WORKERS", "4"))))
+
+    def build(ip: str) -> tuple[str, dict[str, Any]]:
+        return ip, build_risk_profile(ip, ipapi_items.get(ip))
+
+    try:
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(build, ip) for ip in ips_to_query]
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    ip, profile = future.result()
+                    new_entries[ip] = profile
+                except Exception as e:
+                    print(f"[enrich_ip_info] risk profile failed: {e}", flush=True)
+    except Exception as e:
+        print(f"[enrich_ip_info] multi-source check failed: {e}", flush=True)
+        for ip in ips_to_query:
+            try:
+                new_entries[ip] = build_risk_profile(ip, ipapi_items.get(ip))
+            except Exception:
+                pass
 
     if not new_entries:
         return
 
-    # 3. Save cache thread-safely (reload & update to avoid overwrite of concurrent queries)
     with ip_cache_lock:
         cache = load_ip_cache()
         cache.update(new_entries)
         save_ip_cache(cache)
 
-    # 4. Enrich nodes with newly queried info
     for node in nodes:
         ip = node.get("ip") or node.get("remote_host")
         if ip in new_entries:
-            cached = new_entries[ip]
-            node["owner"] = cached.get("owner", "")
-            node["asn"] = cached.get("asn", "")
-            node["as_name"] = cached.get("as_name", "")
-            node["location"] = cached.get("location", "")
-            node["ip_type"] = cached.get("ip_type", "")
-            node["quality"] = cached.get("quality", "")
+            apply_ip_profile(node, new_entries[ip])
