@@ -1,6 +1,6 @@
 # Eianun免费聚合落地IP 🌐
 
-基于 VPNGate + OpenVPN 的 Linux VPS 出站代理网关二改版。此版本已去除原项目广告入口，新增指定地区拉取、同地区故障转移、住宅 IP 优先选择。
+基于 VPNGate + OpenVPN 的 Linux VPS 出站代理网关二改版。此版本已去除原项目广告入口，新增指定地区拉取、同地区故障转移、IP 类型优先级与自动兜底。
 
 ## 主要改动
 
@@ -82,16 +82,24 @@ en country
 
 ```bash
 VPNGATE_TARGET_COUNTRIES=JP,日本
+
+# 自动连接/故障转移 IP 类型优先级：默认住宅 IP 优先
+# 可选 residential / mobile / normal / hosting / proxy / all
+# 默认不是硬过滤；无首选类型时会按 住宅 -> 移动 -> 普通/未知 -> 机房 -> 代理IP 逐级兜底。
+TARGET_IP_TYPES=residential
 ```
 
-留空表示拉取全部地区。
+地区留空表示拉取全部地区；IP 类型填 `all` 表示自动切换不限制类型，直接按综合风险/延迟排序。
 
 
 ## 固定地区与故障转移
 
 - 如果你在“拉取地区过滤”里设置了 `GB,英国`，系统只拉取英国节点，自动切换也只在英国节点中进行。
 - 如果没有设置拉取地区，但你在面板手动选择了某个英国节点，系统会把该节点国家记录为故障转移地区；后续该节点失效时，会优先在英国节点中自动切换。
-- 自动切换排序会优先选择已检测为 `住宅 IP` 的节点，其次再按延迟、Ping、分数排序。
+- 自动切换现在使用 **IP 类型优先级**，不是死板硬过滤。默认 `residential` 表示住宅 IP 优先。
+- 如果当前国家没有住宅 IP，会继续按 `移动 IP -> 普通/未知 -> 机房 IP -> 代理 IP/Tor` 逐级兜底，尽量保持服务运行。
+- 如果你把 IP 类型设置成 `residential,mobile`，则会先找住宅，再找移动；仍然没有时继续按后续类型兜底。
+- 如果你设置成 `all`，自动切换会直接把全部类型放进综合风险/延迟排序。
 - 默认开启严格同地区故障转移；如需在同地区无可用节点时允许跨地区兜底，可在环境变量中设置：
 
 ```bash
@@ -103,17 +111,18 @@ STRICT_COUNTRY_FAILOVER=0
 ## 常用命令
 
 ```bash
-eianun status      # 查看状态
-eianun start       # 启动服务
-eianun stop        # 停止服务
-eianun restart     # 重启服务
-eianun logs        # 查看日志
-eianun web         # 修改网页绑定地址/安全后缀
-eianun port        # 修改网页端口
-eianun password    # 修改管理账号密码
+en status      # 查看状态
+en start       # 启动服务
+en stop        # 停止服务
+en restart     # 重启服务
+en logs        # 查看日志
+en web         # 修改网页绑定地址/安全后缀
+en port        # 修改网页端口
+en password    # 修改管理账号密码
 en country     # 设置节点拉取地区
-eianun update      # 从 GitHub 更新
-eianun uninstall   # 卸载
+en iptype      # 设置自动选择/故障转移 IP 类型，例如住宅IP
+en update      # 从 GitHub 拉取最新代码并重新安装/重启
+en uninstall   # 卸载
 ```
 
 兼容命令：`eianun` 会指向 `en`；旧 `ml` 会在安装时自动删除。
@@ -158,7 +167,7 @@ eianun uninstall   # 卸载
 
 ### 🛡️ 多源 IP 风控与干净度评分
 
-新版内置多源 IP 风控评分，节点检测通过 OpenVPN 握手后，会继续对入口 IP 做多维度质量检查，用于自动排序、手动切换限制和故障转移选择。
+新版内置多源 IP 风控评分，节点检测通过 OpenVPN 握手后，会继续对入口 IP 做多维度质量检查，用于自动排序、手动风险提示和故障转移优选。
 
 默认检测维度：
 
@@ -177,18 +186,35 @@ eianun uninstall   # 卸载
 
 默认策略：
 
-- 只允许自动连接 `欺诈值 <= 25` 且无黑名单命中的节点。
-- 自动故障转移只会选择通过风控的干净备用节点。
-- 未检测节点、黑名单命中节点、中高风险节点默认不允许切换。
+- 自动故障转移采用 **balanced + IP 类型优先级**：先选择首选类型里 `欺诈值 <= 25` 且无黑名单命中的干净备用节点。
+- 默认 IP 类型优先级是 `residential`，即住宅 IP 优先；但如果当前国家没有住宅 IP，不会停摆，会按移动/普通/机房/代理逐级兜底。
+- 代理 IP 是最后兜底选项：只有前面类型都没有可用节点时才会参与自动故障转移。
+- 手动切换不会被风控硬拦截：高风险/未检测节点会弹出提示，确认后仍可强制尝试。
+- 如果想让自动故障转移绝对严格，可设置 `AUTO_RISK_MODE=strict` 且 `AUTO_MIN_KEEP_RUNNING=0`。
+- 如果想完全禁止手动强制切换，可设置 `ALLOW_MANUAL_RISKY_CONNECT=0`。
 
 可选环境变量：
 
 ```bash
-# 自动连接允许的最高欺诈值，默认 25
+# 自动优选的干净 IP 欺诈值阈值，默认 25；超过后会降权，但 balanced 模式不会直接停摆
 MAX_AUTO_FRAUD_SCORE=25
 
-# 是否允许手动/自动连接风险节点，默认关闭，不建议开启
+# 自动故障转移风控模式：balanced / strict / loose，默认 balanced
+AUTO_RISK_MODE=balanced
+
+# balanced 模式下没有干净 IP 时是否继续按 IP 类型优先级兜底保持运行，默认 1
+AUTO_MIN_KEEP_RUNNING=1
+
+# 自动连接/故障转移 IP 类型优先级，默认 residential。
+# 默认不是硬过滤；会按首选类型开始，再逐级兜底到代理IP。
+# residential=住宅IP；mobile=移动；normal=普通/未知；hosting=机房；proxy=代理；all=全部
+TARGET_IP_TYPES=residential
+
+# 是否全局允许自动/手动连接风险节点，默认关闭；开启后风控仅展示不阻断
 ALLOW_RISKY_IP_CONNECT=0
+
+# 是否允许面板手动确认后强制尝试风险节点，默认开启
+ALLOW_MANUAL_RISKY_CONNECT=1
 
 # 是否启用 DNSBL 黑名单检测，默认开启
 IP_DNSBL_CHECK=1
@@ -204,3 +230,18 @@ IP_RISK_CACHE_TTL_SECONDS=86400
 ```
 
 如需修改，在 `/etc/default/eianun-vpngate` 中写入对应变量后重启服务。
+
+
+### IP 类型优先级说明
+
+默认 `TARGET_IP_TYPES=residential` 的含义是：**优先选择住宅 IP**，不是“没有住宅 IP 就不运行”。自动故障转移会按以下顺序兜底：
+
+```text
+住宅 IP -> 移动 IP -> 普通/未知 -> 机房 IP -> 代理 IP/Tor
+```
+
+如果你确实想把 IP 类型当成硬过滤，可以额外设置：
+
+```bash
+STRICT_IP_TYPE_FILTER=1
+```

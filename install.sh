@@ -341,7 +341,7 @@ def generate_random_suffix():
 def load_ui_cfg():
     import json
     path = "/opt/eianun-vpngate/vpngate_data/ui_auth.json"
-    cfg = {"host": "0.0.0.0", "port": 8787, "secret_path": "EJsW2EeBo9lY", "password": "", "target_countries": ""}
+    cfg = {"host": "0.0.0.0", "port": 8787, "secret_path": "EJsW2EeBo9lY", "password": "", "target_countries": "", "target_ip_types": "residential"}
     if os.path.exists(path):
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -554,6 +554,7 @@ def print_status():
     masked_pwd = curr_pwd if len(curr_pwd) <= 4 else curr_pwd[:3] + "********" + curr_pwd[-2:]
     print_line(format_line("网页管理密码", masked_pwd))
     print_line(format_line("节点拉取地区", cfg.get("target_countries", "") or "全部地区"))
+    print_line(format_line("自动IP优先级", cfg.get("target_ip_types", "residential") or "全部类型"))
     print_line()
     print_line("【活动节点状态】")
     if is_connecting:
@@ -578,6 +579,7 @@ def print_status():
     print_line("【使用方法】")
     print_line(f"  export http_proxy=socks5://127.0.0.1:7928")
     print_line(f"  export https_proxy=socks5://127.0.0.1:7928")
+    print_line("【常用指令】en status | en update | en restart | en country | en iptype | en password")
     print_line("=======================================================")
 
 def start_service():
@@ -851,6 +853,36 @@ def configure_country():
     print(f"节点拉取地区已更新为: {val or '全部地区'}")
     ask_restart()
 
+def configure_iptype():
+    cfg = load_ui_cfg()
+    print("\033[H\033[J", end="")
+    print("=======================================================")
+    print("                    自动IP类型优先级配置               ")
+    print("=======================================================")
+    current = cfg.get('target_ip_types', 'residential') or 'all'
+    print(f"当前自动IP优先级: {current}")
+    print("  [1] 住宅IP优先，最后代理IP兜底 (residential，推荐)")
+    print("  [2] 住宅IP，其次移动IP，最后代理IP兜底 (residential,mobile)")
+    print("  [3] 住宅/普通未知/移动优先，最后代理IP兜底 (residential,normal,mobile)")
+    print("  [4] 全部类型按风险/延迟排序 (all)")
+    print("  [5] 自定义优先级，例如 residential,mobile")
+    sel = input("请选择 [1-5, 回车默认1]: ").strip() or '1'
+    mapping = {
+        '1': 'residential',
+        '2': 'residential,mobile',
+        '3': 'residential,normal,mobile',
+        '4': 'all',
+    }
+    if sel == '5':
+        val = input("请输入IP类型优先级 (residential,mobile,normal,hosting,proxy,all): ").strip() or 'residential'
+    else:
+        val = mapping.get(sel, 'residential')
+    cfg['target_ip_types'] = val
+    save_ui_cfg(cfg)
+    print(f"自动IP类型优先级已更新为: {val}")
+    print("说明: 默认不是硬过滤；无首选类型时会按住宅 -> 移动 -> 普通/未知 -> 机房 -> 代理IP逐级兜底，避免自动故障转移停摆。")
+    ask_restart()
+
 def getch():
     fd = sys.stdin.fileno()
     try:
@@ -961,8 +993,10 @@ def main():
             configure_credentials()
         elif cmd == "country":
             configure_country()
+        elif cmd in ("iptype", "ip-type", "type"):
+            configure_iptype()
         else:
-            print("未知命令。可用命令: start, stop, restart, status, logs, update, uninstall, web, port, password, country")
+            print("未知命令。可用命令: start, stop, restart, status, logs, update, uninstall, web, port, password, country, iptype")
         sys.exit(0)
         
     options = {
@@ -974,7 +1008,8 @@ def main():
         '6': ("端口配置 (en port)", configure_port),
         '7': ("账号密码 (en password)", configure_credentials),
         '8': ("地区过滤 (en country)", configure_country),
-        '9': ("一键更新 (en update)", update_service),
+        '9': ("自动IP类型 (en iptype)", configure_iptype),
+        '0': ("一键更新 (en update)", update_service),
         'a': ("完全卸载 (en uninstall)", uninstall_service),
         '0': ("退出终端", None)
     }
@@ -1038,7 +1073,7 @@ def main():
                     print(f"执行出错: {e}")
                     
                 if func not in (start_service, stop_service, restart_service,
-                                configure_web, configure_port, configure_credentials, configure_country, show_logs, update_service):
+                                configure_web, configure_port, configure_credentials, configure_country, configure_iptype, show_logs, update_service):
                     input("\n操作已完成，按回车键返回主菜单...")
                     
                 # Re-enter alternate buffer and hide cursor
@@ -1089,6 +1124,10 @@ TARGET_COUNTRIES_INPUT="$(${PYTHON_BIN} -c "import json; p='$AUTH_FILE'
 try:
  d=json.load(open(p,encoding='utf-8')); print(d.get('target_countries',''))
 except Exception: print('')" 2>/dev/null || echo '')"
+TARGET_IP_TYPES_INPUT="$(${PYTHON_BIN} -c "import json; p='$AUTH_FILE'
+try:
+ d=json.load(open(p,encoding='utf-8')); print(d.get('target_ip_types','residential'))
+except Exception: print('residential')" 2>/dev/null || echo 'residential')"
 NEED_WRITE=0
 [ ! -f "$AUTH_FILE" ] && NEED_WRITE=1
 
@@ -1098,7 +1137,8 @@ say "  -> 当前端口: ${GREEN}${UI_PORT}${PLAIN}"
 say "  -> 当前账号: ${GREEN}${UI_USERNAME}${PLAIN}"
 say "  -> 当前安全后缀: ${GREEN}${SECRET_PATH}${PLAIN}"
 say "  -> 当前拉取地区: ${GREEN}${TARGET_COUNTRIES_INPUT:-全部地区}${PLAIN}"
-ask "是否现在配置端口/安全后缀/登录账号密码/拉取地区？[y/N]: "
+say "  -> 当前自动IP类型: ${GREEN}${TARGET_IP_TYPES_INPUT:-residential}${PLAIN}"
+ask "是否现在配置端口/安全后缀/登录账号密码/拉取地区/IP类型？[y/N]: "
 is_custom="$REPLY_VALUE"
 
 case "$is_custom" in
@@ -1133,11 +1173,14 @@ case "$is_custom" in
         done
         ask "请输入节点拉取地区 [留空=全部地区，例如 JP,日本,US]: "
         TARGET_COUNTRIES_INPUT="$REPLY_VALUE"
+        ask "请输入自动IP类型优先级 [默认 residential，可填 all/residential,mobile]: "
+        iptype_input="$REPLY_VALUE"
+        if [ -n "$iptype_input" ]; then TARGET_IP_TYPES_INPUT="$iptype_input"; fi
         ;;
 esac
 
 if [ "$NEED_WRITE" = "1" ]; then
-    AUTH_FILE="$AUTH_FILE" UI_PORT="$UI_PORT" SECRET_PATH="$SECRET_PATH" UI_USERNAME="$UI_USERNAME" UI_PASSWORD="$UI_PASSWORD" TARGET_COUNTRIES_INPUT="$TARGET_COUNTRIES_INPUT" ${PYTHON_BIN} - <<'PY_SAVE_AUTH'
+    AUTH_FILE="$AUTH_FILE" UI_PORT="$UI_PORT" SECRET_PATH="$SECRET_PATH" UI_USERNAME="$UI_USERNAME" UI_PASSWORD="$UI_PASSWORD" TARGET_COUNTRIES_INPUT="$TARGET_COUNTRIES_INPUT" TARGET_IP_TYPES_INPUT="$TARGET_IP_TYPES_INPUT" ${PYTHON_BIN} - <<'PY_SAVE_AUTH'
 import json
 import os
 cfg = {
@@ -1147,6 +1190,7 @@ cfg = {
     'username': os.environ.get('UI_USERNAME') or 'admin',
     'password': os.environ.get('UI_PASSWORD') or 'admin',
     'target_countries': os.environ.get('TARGET_COUNTRIES_INPUT') or '',
+    'target_ip_types': os.environ.get('TARGET_IP_TYPES_INPUT') or 'residential',
 }
 with open(os.environ['AUTH_FILE'], 'w', encoding='utf-8') as f:
     json.dump(cfg, f, ensure_ascii=False, indent=2)
@@ -1224,4 +1268,5 @@ say "  * 查看实时日志:   ${YELLOW}en logs${PLAIN}"
 say "  * 停止服务:       ${YELLOW}en stop${PLAIN}"
 say "  * 重启服务:       ${YELLOW}en restart${PLAIN}"
 say "  * 设置拉取地区:   ${YELLOW}en country${PLAIN}"
+say "  * 设置自动IP类型: ${YELLOW}en iptype${PLAIN}"
 say "=========================================================="

@@ -51,9 +51,24 @@ INVALID_BACKOFF_SECONDS = int(os.environ.get("INVALID_BACKOFF_SECONDS", str(30 *
 # 1 = 手动选择某个地区节点后，故障转移只在同地区内切换；0 = 同地区无可用时允许跨地区兜底。
 STRICT_COUNTRY_FAILOVER = os.environ.get("STRICT_COUNTRY_FAILOVER", "1").strip().lower() not in {"0", "false", "no", "off"}
 TARGET_COUNTRIES_ENV = os.environ.get("VPNGATE_TARGET_COUNTRIES") or os.environ.get("TARGET_COUNTRIES") or os.environ.get("TARGET_COUNTRY") or ""
-# 风控策略：默认只自动连接无黑名单命中、欺诈值较低的干净 IP。
+# 风控策略：默认“优先干净，但不断线”。
+# strict   = 自动故障转移只选低风险干净 IP；没有干净节点就等待补充。
+# balanced = 默认模式，先选干净 IP；如果同地区全是高欺诈值/代理节点，则选择综合风险最低的可用节点兜底。
+# loose    = 自动故障转移只按连通性和延迟排序，风控仅作展示。
 MAX_AUTO_FRAUD_SCORE = int(os.environ.get("MAX_AUTO_FRAUD_SCORE", "25"))
+AUTO_RISK_MODE = os.environ.get("AUTO_RISK_MODE", "balanced").strip().lower()
+if AUTO_RISK_MODE not in {"strict", "balanced", "loose"}:
+    AUTO_RISK_MODE = "balanced"
+AUTO_MIN_KEEP_RUNNING = os.environ.get("AUTO_MIN_KEEP_RUNNING", "1").strip().lower() not in {"0", "false", "no", "off"}
 ALLOW_RISKY_IP_CONNECT = os.environ.get("ALLOW_RISKY_IP_CONNECT", "0").strip().lower() in {"1", "true", "yes", "on"}
+ALLOW_MANUAL_RISKY_CONNECT = os.environ.get("ALLOW_MANUAL_RISKY_CONNECT", "1").strip().lower() not in {"0", "false", "no", "off"}
+# 自动选择/故障转移的 IP 类型优先级。默认住宅 IP 优先，但不会把自动保活卡死；
+# 没有首选类型时会按 住宅 -> 移动 -> 普通/未知 -> 机房 -> 代理/Tor 逐级兜底。
+# 可用值：residential, mobile, normal, hosting, proxy, tor, unknown, all。
+# 只有用户显式设置环境变量时才覆盖面板保存值。
+TARGET_IP_TYPES_ENV = os.environ.get("TARGET_IP_TYPES") or os.environ.get("AUTO_IP_TYPES") or os.environ.get("TARGET_IP_TYPE") or ""
+# 1 = 恢复旧逻辑，把 TARGET_IP_TYPES 当作硬过滤；0 = 默认，将其作为优先级，必要时兜底到代理 IP 保持运行。
+STRICT_IP_TYPE_FILTER = os.environ.get("STRICT_IP_TYPE_FILTER", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ["VPNGATE_DATA_DIR"]).resolve() if os.environ.get("VPNGATE_DATA_DIR") else ROOT_DIR / "vpngate_data"
@@ -130,7 +145,8 @@ def load_ui_config() -> dict[str, Any]:
             "password": "",
             "host": "0.0.0.0",
             "port": 8787,
-            "target_countries": TARGET_COUNTRIES_ENV
+            "target_countries": TARGET_COUNTRIES_ENV,
+            "target_ip_types": TARGET_IP_TYPES_ENV or "residential"
         }
         updated = False
         if auth_file.exists():
@@ -142,6 +158,8 @@ def load_ui_config() -> dict[str, Any]:
                 pass
         if TARGET_COUNTRIES_ENV:
             config["target_countries"] = TARGET_COUNTRIES_ENV
+        if TARGET_IP_TYPES_ENV:
+            config["target_ip_types"] = TARGET_IP_TYPES_ENV
         
         if not config.get("username"):
             config["username"] = generate_random_username()
@@ -186,6 +204,89 @@ def normalize_target_countries_input(value: Any) -> str:
 def get_target_countries() -> list[str]:
     cfg = load_ui_config()
     return split_target_countries(cfg.get("target_countries") or TARGET_COUNTRIES_ENV)
+
+IP_TYPE_ALIASES: dict[str, tuple[str, ...]] = {
+    "residential": ("residential", "住宅", "家宽", "原生", "home", "isp", "clean_residential"),
+    "mobile": ("mobile", "移动", "手机", "蜂窝"),
+    "normal": ("normal", "普通", "unknown", "未知", "空", "未识别", ""),
+    "hosting": ("hosting", "datacenter", "data_center", "dc", "机房", "数据中心", "服务器", "vps", "cloud"),
+    "proxy": ("proxy", "代理", "vpn"),
+    "tor": ("tor", "洋葱"),
+}
+
+def normalize_ip_type_token(value: Any) -> str:
+    token = str(value or "").strip().lower().replace(" ", "_").replace("-", "_")
+    if token in {"all", "any", "全部", "不限", "任意", "*"}:
+        return "all"
+    for canonical, aliases in IP_TYPE_ALIASES.items():
+        if token in {str(a).strip().lower().replace(" ", "_").replace("-", "_") for a in aliases}:
+            return canonical
+    return token
+
+def split_target_ip_types(value: Any) -> list[str]:
+    if isinstance(value, (list, tuple, set)):
+        raw_parts = [str(x).strip() for x in value]
+    else:
+        raw_parts = re.split(r"[,，;；\s]+", str(value or ""))
+    result: list[str] = []
+    seen: set[str] = set()
+    for part in raw_parts:
+        token = normalize_ip_type_token(part)
+        if not token:
+            continue
+        if token == "all":
+            return []
+        if token not in seen:
+            result.append(token)
+            seen.add(token)
+    return result
+
+def normalize_target_ip_types_input(value: Any) -> str:
+    # Preserve explicit all/全部 so the UI can distinguish it from an empty default.
+    if isinstance(value, str):
+        raw_parts = re.split(r"[,，;；\s]+", value)
+        if any(normalize_ip_type_token(part) == "all" for part in raw_parts if part.strip()):
+            return "all"
+    types = split_target_ip_types(value)
+    return ",".join(types)
+
+def get_target_ip_types() -> list[str]:
+    cfg = load_ui_config()
+    return split_target_ip_types(cfg.get("target_ip_types") or TARGET_IP_TYPES_ENV or "residential")
+
+def ip_type_display(value: Any) -> str:
+    token = normalize_ip_type_token(value)
+    return {
+        "residential": "住宅IP",
+        "mobile": "移动IP",
+        "normal": "普通/未知",
+        "hosting": "机房IP",
+        "proxy": "代理IP",
+        "tor": "Tor出口",
+    }.get(token, str(value or ""))
+
+def target_ip_types_display(value: Any) -> str:
+    types = split_target_ip_types(value)
+    if not types:
+        return "全部类型"
+    label = "、".join(ip_type_display(t) for t in types)
+    if STRICT_IP_TYPE_FILTER:
+        return f"{label}硬过滤"
+    return f"{label}优先"
+
+def node_matches_target_ip_types(node: dict[str, Any], target_types: list[str]) -> bool:
+    if not target_types:
+        return True
+    ip_type = normalize_ip_type_token(node.get("ip_type") or "unknown")
+    quality = normalize_ip_type_token(node.get("quality") or "")
+    node_tokens = {ip_type, quality}
+    if quality in {"clean_residential", "residential"}:
+        node_tokens.add("residential")
+    if quality in {"datacenter", "hosting"}:
+        node_tokens.add("hosting")
+    if not node_has_risk_data(node) and "normal" in target_types:
+        node_tokens.add("normal")
+    return any(t in node_tokens for t in target_types)
 
 def row_country_tokens(row: dict[str, str]) -> set[str]:
     country_long = (row.get("CountryLong") or "").strip()
@@ -336,6 +437,160 @@ def node_sort_key(node: dict[str, Any]) -> tuple[int, int, int, int, int]:
         -parse_int(node.get("score")),
     )
 
+def node_auto_fallback_key(node: dict[str, Any]) -> tuple[int, int, int, int, int, int]:
+    """Lower is better for emergency failover. Risk is a ranking factor, not a hard block."""
+    risk_level = str(node.get("risk_level") or "unknown").lower()
+    ip_type = normalize_ip_type_token(node.get("ip_type") or "unknown")
+    blacklist_count = parse_int(node.get("blacklist_count"))
+    fraud_score = node_fraud_score(node, unknown=80)
+
+    risk_rank = 0
+    if blacklist_count > 0:
+        risk_rank += 80 + min(blacklist_count, 9)
+    if risk_level == "blocked":
+        risk_rank += 70
+    elif risk_level == "high":
+        risk_rank += 45
+    elif risk_level == "medium":
+        risk_rank += 25
+    elif risk_level in {"unknown", ""}:
+        risk_rank += 15
+    if ip_type in {"proxy", "tor"}:
+        risk_rank += 35
+    elif ip_type in {"hosting", "datacenter"}:
+        risk_rank += 20
+    elif ip_type == "mobile":
+        risk_rank += 5
+    elif ip_type == "residential":
+        risk_rank -= 10
+
+    return (
+        risk_rank,
+        fraud_score,
+        node_ip_priority_rank(node),
+        parse_int(node.get("latency_ms")) or 999999,
+        parse_int(node.get("ping")) or 999999,
+        -parse_int(node.get("score")),
+    )
+
+DEFAULT_IP_TYPE_FALLBACK_ORDER = ["residential", "mobile", "normal", "hosting", "proxy", "tor"]
+
+def ip_type_preference_order(preferred_types: list[str]) -> list[str]:
+    """Return preferred IP type order with safe auto-fallback tiers appended.
+
+    TARGET_IP_TYPES is treated as preference by default, not a hard filter. For example,
+    residential means: residential first, then mobile, normal/unknown, hosting, proxy, tor.
+    Set STRICT_IP_TYPE_FILTER=1 to restore hard filtering.
+    """
+    if not preferred_types:
+        return list(DEFAULT_IP_TYPE_FALLBACK_ORDER)
+    order: list[str] = []
+    seen: set[str] = set()
+    for item in preferred_types:
+        token = normalize_ip_type_token(item)
+        if token and token != "all" and token not in seen:
+            order.append(token)
+            seen.add(token)
+    if STRICT_IP_TYPE_FILTER:
+        return order
+    for item in DEFAULT_IP_TYPE_FALLBACK_ORDER:
+        if item not in seen:
+            order.append(item)
+            seen.add(item)
+    return order
+
+def tiered_ip_type_candidates(candidates: list[dict[str, Any]], preferred_types: list[str]) -> tuple[list[dict[str, Any]], str]:
+    """Choose the first available IP-type tier, sorted by risk/latency.
+
+    This prevents auto failover from stopping when a country has no residential IP, while still
+    making proxy/Tor the last resort.
+    """
+    if not candidates:
+        return [], "无候选节点"
+    if not preferred_types:
+        pool = list(candidates)
+        pool.sort(key=node_auto_fallback_key)
+        return pool, "全部类型按综合风险/延迟排序"
+
+    if STRICT_IP_TYPE_FILTER:
+        pool = [n for n in candidates if node_matches_target_ip_types(n, preferred_types)]
+        pool.sort(key=node_auto_fallback_key)
+        return pool, f"严格 IP 类型过滤：{target_ip_types_display(preferred_types)}"
+
+    used_ids: set[str] = set()
+    for ip_type in ip_type_preference_order(preferred_types):
+        tier = []
+        for node in candidates:
+            node_key = str(node.get("id") or id(node))
+            if node_key in used_ids:
+                continue
+            if node_matches_target_ip_types(node, [ip_type]):
+                tier.append(node)
+                used_ids.add(node_key)
+        if tier:
+            tier.sort(key=node_auto_fallback_key)
+            return tier, f"IP 类型优先级命中：{ip_type_display(ip_type)}"
+
+    pool = list(candidates)
+    pool.sort(key=node_auto_fallback_key)
+    return pool, "未识别 IP 类型，按综合风险/延迟兜底"
+
+def choose_auto_failover_candidates(scoped_candidates: list[dict[str, Any]], all_candidates: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], str]:
+    """Pick automatic failover candidates.
+
+    Country remains the main scope. IP type is a preference chain, not a dead-end filter:
+    residential -> mobile -> normal/unknown -> hosting/datacenter -> proxy/Tor. Risk scoring
+    is used for ranking. It only becomes a hard block when strict mode and keep-running are disabled.
+    """
+    target_ip_types = get_target_ip_types()
+    ip_type_label = target_ip_types_display(target_ip_types)
+
+    if STRICT_IP_TYPE_FILTER:
+        scoped_pool = [n for n in scoped_candidates if node_matches_target_ip_types(n, target_ip_types)] if target_ip_types else list(scoped_candidates)
+        all_pool = [n for n in all_candidates if node_matches_target_ip_types(n, target_ip_types)] if target_ip_types else list(all_candidates)
+    else:
+        scoped_pool = list(scoped_candidates)
+        all_pool = list(all_candidates)
+
+    clean_scoped = [n for n in scoped_pool if node_is_clean_for_connect(n)]
+    clean_all = [n for n in all_pool if node_is_clean_for_connect(n)]
+
+    if AUTO_RISK_MODE == "loose" or ALLOW_RISKY_IP_CONNECT:
+        candidates, tier_reason = tiered_ip_type_candidates(scoped_pool, target_ip_types)
+        if not candidates and not STRICT_COUNTRY_FAILOVER:
+            candidates, tier_reason = tiered_ip_type_candidates(all_pool, target_ip_types)
+            if candidates:
+                return candidates, f"宽松模式跨地区兜底；{tier_reason}"
+        if candidates:
+            return candidates, f"宽松模式：{tier_reason}"
+        return [], f"没有可用节点；IP 类型策略 {ip_type_label}"
+
+    clean_candidates, clean_tier_reason = tiered_ip_type_candidates(clean_scoped, target_ip_types)
+    if clean_candidates:
+        clean_candidates.sort(key=node_sort_key)
+        return clean_candidates, f"优先选择同地区干净节点；{clean_tier_reason}"
+
+    if not STRICT_COUNTRY_FAILOVER:
+        clean_cross, cross_reason = tiered_ip_type_candidates(clean_all, target_ip_types)
+        if clean_cross:
+            clean_cross.sort(key=node_sort_key)
+            return clean_cross, f"同地区无干净节点，跨地区选择干净节点；{cross_reason}"
+
+    if AUTO_RISK_MODE == "strict" and not AUTO_MIN_KEEP_RUNNING:
+        return [], f"严格模式：没有符合阈值的干净节点；IP 类型策略 {ip_type_label}"
+
+    fallback_pool = scoped_pool
+    fallback_candidates, fallback_reason = tiered_ip_type_candidates(fallback_pool, target_ip_types)
+    if fallback_candidates:
+        return fallback_candidates, f"保活兜底：无干净 IP，按同地区 IP 类型优先级逐级选择；{fallback_reason}"
+
+    if not STRICT_COUNTRY_FAILOVER:
+        fallback_candidates, fallback_reason = tiered_ip_type_candidates(all_pool, target_ip_types)
+        if fallback_candidates:
+            return fallback_candidates, f"跨地区保活兜底：按 IP 类型优先级逐级选择；{fallback_reason}"
+
+    return [], "没有可用节点；将继续后台拉取/检测"
+
 def get_failover_targets(active_node: dict[str, Any] | None = None) -> list[str]:
     """Return the country scope used by auto failover.
 
@@ -435,14 +690,21 @@ def get_state() -> dict[str, Any]:
     state["port"] = ui_cfg.get("port", 8787)
     state["secret_path"] = ui_cfg.get("secret_path", "EJsW2EeBo9lY")
     target_countries = normalize_target_countries_input(ui_cfg.get("target_countries") or TARGET_COUNTRIES_ENV)
+    target_ip_types = normalize_target_ip_types_input(ui_cfg.get("target_ip_types") or TARGET_IP_TYPES_ENV or "residential")
     state["target_countries"] = target_countries
     state["target_countries_display"] = target_countries or "全部地区"
+    state["target_ip_types"] = target_ip_types
+    state["target_ip_types_display"] = target_ip_types_display(target_ip_types)
     state.setdefault("failover_country_short", "")
     state.setdefault("failover_country", "")
     state.setdefault("failover_country_display", target_countries or "未固定")
     state["strict_country_failover"] = STRICT_COUNTRY_FAILOVER
     state["max_auto_fraud_score"] = MAX_AUTO_FRAUD_SCORE
+    state["auto_risk_mode"] = AUTO_RISK_MODE
+    state["auto_min_keep_running"] = AUTO_MIN_KEEP_RUNNING
+    state["strict_ip_type_filter"] = STRICT_IP_TYPE_FILTER
     state["allow_risky_ip_connect"] = ALLOW_RISKY_IP_CONNECT
+    state["allow_manual_risky_connect"] = ALLOW_MANUAL_RISKY_CONNECT
     
     return state
 
@@ -1057,22 +1319,19 @@ def auto_switch_node(attempt: int = 0) -> None:
             and not n.get("active")
         ]
         scoped_candidates = [n for n in all_candidates if node_matches_target_countries(n, failover_targets)] if failover_targets else all_candidates
-        clean_scoped_candidates = [n for n in scoped_candidates if node_is_clean_for_connect(n)]
-        clean_all_candidates = [n for n in all_candidates if node_is_clean_for_connect(n)]
-        candidates = clean_scoped_candidates
-        if not candidates and not STRICT_COUNTRY_FAILOVER:
-            candidates = clean_all_candidates
-        candidates.sort(key=node_sort_key)
+        candidates, candidate_reason = choose_auto_failover_candidates(scoped_candidates, all_candidates)
         scope_display = normalize_target_countries_input(failover_targets) if failover_targets else "全部地区"
+        ip_type_scope_display = target_ip_types_display(get_target_ip_types())
         
     if candidates:
         next_node = candidates[0]
-        ip_kind = f"干净度 {next_node.get('clean_score', 0)} / 欺诈值 {next_node.get('fraud_score', 0)}"
-        msg = f"当前连接已失效或代理连通性检测失败，正在按固定地区 {scope_display} 自动切换至干净备用节点: {next_node['id']} ({ip_kind})"
+        clean_ok = node_is_clean_for_connect(next_node)
+        ip_kind = f"干净度 {next_node.get('clean_score', 0)} / 欺诈值 {next_node.get('fraud_score', 0)} / 黑名单 {next_node.get('blacklist_count', 0)}"
+        msg = f"当前连接已失效或代理连通性检测失败，正在按固定地区 {scope_display} / IP 类型 {ip_type_scope_display} 自动切换: {next_node['id']} ({ip_kind})；策略: {candidate_reason}"
         print(f"[自动切换] {msg}", flush=True)
         log_to_json("INFO", "VPN", msg)
         try:
-            connect_node(next_node["id"], update_failover_scope=False)
+            connect_node(next_node["id"], update_failover_scope=False, allow_auto_risky=not clean_ok)
         except Exception as e:
             err_msg = f"切换到备用节点 {next_node['id']} 失败: {e}，将尝试下一个..."
             print(f"[自动切换] {err_msg}", flush=True)
@@ -1080,7 +1339,7 @@ def auto_switch_node(attempt: int = 0) -> None:
             auto_switch_node(attempt + 1)
     else:
         if failover_targets:
-            msg = f"固定地区 {scope_display} 当前没有通过风控的干净备用节点，将清理当前连接并后台拉取同地区新节点..."
+            msg = f"固定地区 {scope_display} / IP 类型 {ip_type_scope_display} 当前没有可用备用节点，将清理当前连接并后台拉取同地区新节点..."
         else:
             msg = "没有可用的备选节点，将自动断开并清理当前连接状态，同时在后台异步获取新节点..."
         print(f"[自动切换] {msg}", flush=True)
@@ -1102,7 +1361,7 @@ def auto_switch_node(attempt: int = 0) -> None:
         
         threading.Thread(target=bg_fetch_and_switch, daemon=True).start()
 
-def connect_node(node_id: str, update_failover_scope: bool = True) -> str:
+def connect_node(node_id: str, update_failover_scope: bool = True, allow_manual_risky: bool = False, allow_auto_risky: bool = False) -> str:
     global active_openvpn_process, active_openvpn_node_id, is_connecting
     with lock:
         if is_connecting:
@@ -1119,11 +1378,20 @@ def connect_node(node_id: str, update_failover_scope: bool = True) -> str:
         if not node:
             raise ValueError(f"Node not found: {node_id}")
         if not node_is_clean_for_connect(node):
-            reason = f"该节点未通过 IP 风控：欺诈值 {node.get('fraud_score', '未知')}，黑名单命中 {node.get('blacklist_count', 0)}，风险等级 {node.get('risk_level', 'unknown')}。请先检测节点，或降低 MAX_AUTO_FRAUD_SCORE/开启 ALLOW_RISKY_IP_CONNECT。"
-            set_state(active_openvpn_node_id="", is_connecting=False, active_node_latency="已阻止", last_check_message=reason)
-            with lock:
-                active_openvpn_node_id = ""
-            raise RuntimeError(reason)
+            reason = f"该节点未通过干净 IP 优选阈值：欺诈值 {node.get('fraud_score', '未知')}，黑名单命中 {node.get('blacklist_count', 0)}，风险等级 {node.get('risk_level', 'unknown')}。"
+            if not (allow_auto_risky or (ALLOW_MANUAL_RISKY_CONNECT and allow_manual_risky)):
+                set_state(active_openvpn_node_id="", is_connecting=False, active_node_latency="已阻止", last_check_message=reason + " 如需手动强制切换可设置 ALLOW_MANUAL_RISKY_CONNECT=1。")
+                with lock:
+                    active_openvpn_node_id = ""
+                raise RuntimeError(reason + " 自动默认会优先选干净 IP；手动切换可在面板确认后强制尝试。")
+            if allow_auto_risky:
+                warn_msg = reason + " 自动故障转移进入保活兜底模式：没有更干净的可用节点，先连接综合风险最低的可用节点，后续维护线程会继续寻找更干净节点。"
+                print(f"[Auto Risk Fallback] {warn_msg}", flush=True)
+            else:
+                warn_msg = reason + " 已按手动确认继续尝试连接，自动故障转移会优先选择低风险干净 IP。"
+                print(f"[Manual Override] {warn_msg}", flush=True)
+            log_to_json("WARNING", "VPN", warn_msg)
+            set_state(last_check_message=warn_msg)
         
         set_state(active_node_latency="清理连接", last_check_message="正在关闭与清理旧的 VPN 连接及网卡...")
         stop_active_openvpn()
@@ -1287,7 +1555,7 @@ def maintain_valid_nodes(force: bool = False, target_override: list[str] | None 
         with lock:
             merged = read_json(NODES_FILE, [])
             if not active_openvpn_running():
-                available_candidates = [n for n in merged if n.get("probe_status") == "available" and node_is_clean_for_connect(n)]
+                available_candidates = [n for n in merged if n.get("probe_status") == "available"]
                 if available_candidates:
                     auto_switch_node()
 
@@ -2508,6 +2776,14 @@ INDEX_HTML = r"""<!doctype html>
     <select id="country_filter">
       <option value="">所有国家</option>
     </select>
+    <select id="ip_type_filter">
+      <option value="">所有IP类型</option>
+      <option value="residential">住宅IP</option>
+      <option value="mobile">移动IP</option>
+      <option value="normal">普通/未知</option>
+      <option value="hosting">机房IP</option>
+      <option value="proxy">代理IP</option>
+    </select>
     <input id="search" placeholder="输入国家、位置、IP、ASN、运营主体等过滤节点..." />
     <button id="btn_batch_test" class="btn-primary" style="height: 42px; padding: 0 20px; font-weight: 600; background: var(--primary-gradient);">
       <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
@@ -2587,6 +2863,17 @@ INDEX_HTML = r"""<!doctype html>
             <label class="form-label" for="settings_target_countries">拉取地区过滤 (留空 = 全部地区)</label>
             <input type="text" id="settings_target_countries" class="input-field" placeholder="例如：JP,日本,US,美国">
             <div style="font-size: 12px; color: var(--text-secondary); margin-top: 6px; line-height: 1.4;">支持国家简称、英文名或中文名，多个地区用逗号分隔。保存后会按指定地区重新拉取节点。</div>
+          </div>
+
+          <div class="form-group" style="margin-bottom: 12px;">
+            <label class="form-label" for="settings_target_ip_types">自动选择 IP 类型优先级</label>
+            <select id="settings_target_ip_types" class="input-field">
+              <option value="residential">住宅 IP 优先，最后代理 IP 兜底</option>
+              <option value="residential,mobile">住宅 IP，其次移动 IP，最后代理 IP 兜底</option>
+              <option value="residential,normal,mobile">住宅 / 普通未知 / 移动优先，最后代理 IP 兜底</option>
+              <option value="all">全部类型按风险/延迟排序</option>
+            </select>
+            <div style="font-size: 12px; color: var(--text-secondary); margin-top: 6px; line-height: 1.4;">默认不是硬过滤：会先找你选择的类型；没有时按住宅 → 移动 → 普通/未知 → 机房 → 代理 IP 逐级兜底，避免自动故障转移停摆。手动切换仍可确认后强制尝试。</div>
           </div>
 
           <div class="form-group" style="margin-bottom: 12px;">
@@ -2787,11 +3074,25 @@ function updateCountryFilter() {
   }
 }
 
+function canonicalIpType(v) {
+  const raw = String(v || "").toLowerCase().replace(/[\s-]+/g, "_");
+  if (["clean_residential", "residential", "home", "isp", "住宅", "家宽"].includes(raw)) return "residential";
+  if (["mobile", "移动"].includes(raw)) return "mobile";
+  if (["hosting", "datacenter", "data_center", "dc", "vps", "cloud", "机房", "数据中心"].includes(raw)) return "hosting";
+  if (["proxy", "vpn", "代理"].includes(raw)) return "proxy";
+  if (["tor"].includes(raw)) return "tor";
+  return "normal";
+}
+
 function getFilteredNodes() {
   const q = $("search").value.toLowerCase();
   const selectedCountry = $("country_filter").value;
+  const selectedIpType = $("ip_type_filter").value;
   return nodes.filter(n => {
     if (selectedCountry && n.country !== selectedCountry) {
+      return false;
+    }
+    if (selectedIpType && ![canonicalIpType(n.ip_type), canonicalIpType(n.quality)].includes(selectedIpType)) {
       return false;
     }
     const searchStr = [
@@ -2900,8 +3201,9 @@ function render(){
   const statusMessage = state.last_check_message || "";
   const activeNodeInfo = activeNode ? `<span class="badge available" style="margin-left:8px; padding:2px 8px;">${esc(translateCountry(activeNode.country))} (${activeNode.id})</span>` : `<span class="badge unavailable" style="margin-left:8px; padding:2px 8px;">无</span>`;
   const targetInfo = state.target_countries_display || state.target_countries || "全部地区";
+  const ipTypeInfo = state.target_ip_types_display || "住宅IP";
   const failoverInfo = state.failover_country_display || targetInfo || "未固定";
-  $("status").innerHTML=`<span class="status-dot"></span>HTTP 代理本地接口：http://127.0.0.1:7928 | 拉取地区：${esc(targetInfo)} | 故障转移地区：${esc(failoverInfo)} | 活动节点：${activeNodeInfo} | 状态：${statusMessage}`;
+  $("status").innerHTML=`<span class="status-dot"></span>HTTP 代理本地接口：http://127.0.0.1:7928 | 拉取地区：${esc(targetInfo)} | 自动IP优先级：${esc(ipTypeInfo)} | 故障转移地区：${esc(failoverInfo)} | 活动节点：${activeNodeInfo} | 状态：${statusMessage}`;
   
   // Update proxy test status card based on background checks
   const pBadge = $("proxy_status_badge");
@@ -2995,7 +3297,7 @@ function render(){
       if (state.is_connecting) switchTitle = "当前正在连接其它节点，请稍候";
       else if (isUnavailable) switchTitle = "该节点当前检测为不可用，可先重新检测";
       else if (isUnknown) switchTitle = "该节点尚未完成可用性和 IP 风控检测，点击后可先检测再切换";
-      else if (!cleanOk) switchTitle = `IP 风控未通过：${translateRiskLevel(n.risk_level)}，欺诈值 ${n.fraud_score ?? "未知"}，黑名单 ${n.blacklist_count || 0}`;
+      else if (!cleanOk) switchTitle = `IP 风控未通过：${translateRiskLevel(n.risk_level)}，欺诈值 ${n.fraud_score ?? "未知"}，黑名单 ${n.blacklist_count || 0}；手动确认后仍可尝试`;
       const connectBtn = isCurrentlyActive 
         ? `<button class="connect-btn" disabled style="background: var(--success-gradient); color: white; cursor: default; opacity: 1;">已连接</button>`
         : `<button class="connect-btn" title="${esc(switchTitle)}" ${state.is_connecting ? 'disabled style="opacity:0.45; cursor:not-allowed;"' : ''} onclick="handleSwitchClick('${esc(n.id)}')">切换</button>`;
@@ -3090,7 +3392,7 @@ function switchBlockReason(n) {
   if (Number(n.blacklist_count || 0) > 0) return `黑名单命中 ${n.blacklist_count || 0} 个: ${(n.blacklist_hits || []).join(", ")}`;
   if (Number(n.fraud_score ?? 100) > Number(state.max_auto_fraud_score ?? 25)) return `欺诈值 ${n.fraud_score ?? "未知"} 高于阈值 ${state.max_auto_fraud_score ?? 25}`;
   if (["medium", "high", "blocked"].includes(riskLevel)) return `风险等级为 ${translateRiskLevel(riskLevel)}`;
-  if (["proxy", "hosting", "tor"].includes(String(n.ip_type || "").toLowerCase())) return `IP 类型为 ${translateIpType(n.ip_type)}，默认不自动切换`;
+  if (["proxy", "hosting", "tor"].includes(String(n.ip_type || "").toLowerCase())) return `IP 类型为 ${translateIpType(n.ip_type)}，风险较高，自动切换会把它放在最后兜底`;
   return "";
 }
 
@@ -3107,25 +3409,42 @@ async function handleSwitchClick(id) {
   const riskSources = Array.isArray(n.risk_sources) ? n.risk_sources : [];
   const needDetect = n.probe_status !== "available" || riskLevel === "unknown" || riskSources.length === 0;
 
+  // 免费节点质量波动较大：检测与风控用于“自动优选”，但手动切换不做硬拦截。
+  // 点确定 = 先检测再判断；点取消 = 直接尝试手动强制切换。
   if (n.probe_status === "unavailable") {
-    const retry = confirm("该节点当前检测为不可用。是否重新检测一次？检测通过后会继续判断 IP 风控。\n\n节点: " + (n.ip || n.remote_host));
-    if (!retry) return;
+    const retry = confirm("该节点上次检测为不可用。\n\n点“确定”：重新检测，检测后再切换。\n点“取消”：不检测，直接尝试手动切换。\n\n节点: " + (n.ip || n.remote_host));
+    if (retry) {
+      n = await testNode(null, id, null, {quiet: false});
+      if (!n) return;
+    } else {
+      connectNode(id, true);
+      return;
+    }
   } else if (needDetect) {
-    const ok = confirm("该节点还没有完成可用性和 IP 风控检测。\n\n是否先检测该节点？检测通过且 IP 干净后会自动切换。");
-    if (!ok) return;
-  }
-
-  if (needDetect || n.probe_status === "unavailable") {
-    n = await testNode(null, id, null, {quiet: false});
-    if (!n) return;
+    const runDetect = confirm("该节点尚未完成可用性/IP 风控检测。\n\n点“确定”：先检测，检测后自动决定是否建议。\n点“取消”：跳过检测，直接尝试手动切换。");
+    if (runDetect) {
+      n = await testNode(null, id, null, {quiet: false});
+      if (!n) return;
+    } else {
+      connectNode(id, true);
+      return;
+    }
   }
 
   if (!isCleanNode(n)) {
-    alert("该节点暂不建议切换：\n" + switchBlockReason(n) + "\n\n你也可以重新检测，或在服务器环境变量中调整 MAX_AUTO_FRAUD_SCORE / ALLOW_RISKY_IP_CONNECT。");
+    const reason = switchBlockReason(n) || "该节点不符合自动优选规则";
+    const force = confirm(
+      "该节点不符合自动优选/干净 IP 规则：\n" + reason +
+      "\n\n说明：自动故障转移仍会优先选择低风险、低欺诈值、无黑名单节点。" +
+      "\n但免费 VPNGate 节点质量参差不齐，你可以手动强制尝试。" +
+      "\n\n是否仍然手动切换到这个节点？"
+    );
+    if (!force) return;
+    connectNode(id, true);
     return;
   }
 
-  connectNode(id);
+  connectNode(id, false);
 }
 
 let pollInterval = null;
@@ -3157,7 +3476,8 @@ function startConnectionPolling() {
   }, 1000);
 }
 
-async function connectNode(id){
+async function connectNode(id, allowRisky){
+  allowRisky = !!allowRisky;
   state.is_connecting = true;
   state.active_openvpn_node_id = id;
   state.active_node_latency = "正在连接";
@@ -3170,7 +3490,7 @@ async function connectNode(id){
     const r = await fetch("./api/connect",{
       method:"POST",
       headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({id})
+      body:JSON.stringify({id, allow_risky: allowRisky})
     });
     const result = await r.json();
     if (!result.ok) {
@@ -3305,6 +3625,7 @@ async function load(){
 
 $("search").oninput=()=>{ currentPage = 1; render(); };
 $("country_filter").onchange=()=>{ currentPage = 1; render(); };
+$("ip_type_filter").onchange=()=>{ currentPage = 1; render(); };
 
 $("refresh").onclick=async()=>{ 
   $("refresh").disabled=true; 
@@ -3385,6 +3706,7 @@ function openSettingsModal() {
     $("settings_port").value = state.port || 8787;
     $("settings_suffix").value = state.secret_path || "EJsW2EeBo9lY";
     $("settings_target_countries").value = state.target_countries || "";
+    $("settings_target_ip_types").value = state.target_ip_types || "residential";
   }
   
   $("settings_modal").style.display = "flex";
@@ -3407,6 +3729,7 @@ async function saveSettings(e) {
   const port = parseInt($("settings_port").value);
   const suffix = $("settings_suffix").value.trim();
   const targetCountries = $("settings_target_countries").value.trim();
+  const targetIpTypes = $("settings_target_ip_types").value.trim();
   const newUsername = $("settings_new_username").value.trim();
   const newPassword = $("settings_new_password").value.trim();
   const currUsername = $("settings_curr_username").value.trim();
@@ -3435,6 +3758,7 @@ async function saveSettings(e) {
         port: port,
         secret_path: suffix,
         target_countries: targetCountries,
+        target_ip_types: targetIpTypes,
         new_username: newUsername,
         new_password: newPassword,
         curr_username: currUsername,
@@ -3852,6 +4176,7 @@ class Handler(BaseHTTPRequestHandler):
                 new_port = payload.get("port")
                 new_suffix = str(payload.get("secret_path") or "").strip()
                 new_target_countries = normalize_target_countries_input(payload.get("target_countries") or "")
+                new_target_ip_types = normalize_target_ip_types_input(payload.get("target_ip_types") or TARGET_IP_TYPES_ENV or "residential")
                 new_username = str(payload.get("new_username") or "").strip()
                 new_password = str(payload.get("new_password") or "").strip()
                 
@@ -3882,6 +4207,7 @@ class Handler(BaseHTTPRequestHandler):
                 ui_cfg["port"] = new_port_int
                 ui_cfg["secret_path"] = new_suffix
                 ui_cfg["target_countries"] = new_target_countries
+                ui_cfg["target_ip_types"] = new_target_ip_types
                 if new_username:
                     ui_cfg["username"] = new_username
                 if new_password:
@@ -3943,7 +4269,8 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 length = parse_int(self.headers.get("Content-Length"))
                 payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
-                self.send_json({"ok": True, "message": connect_node(str(payload.get("id") or ""))})
+                allow_risky = str(payload.get("allow_risky") or "").lower() in {"1", "true", "yes", "on"}
+                self.send_json({"ok": True, "message": connect_node(str(payload.get("id") or ""), allow_manual_risky=allow_risky)})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/test_node":
@@ -4021,6 +4348,8 @@ def main() -> None:
             "blacklisted_nodes": 0,
             "target_countries": normalize_target_countries_input(load_ui_config().get("target_countries") or TARGET_COUNTRIES_ENV),
             "target_countries_display": normalize_target_countries_input(load_ui_config().get("target_countries") or TARGET_COUNTRIES_ENV) or "全部地区",
+            "target_ip_types": normalize_target_ip_types_input(load_ui_config().get("target_ip_types") or TARGET_IP_TYPES_ENV or "residential"),
+            "target_ip_types_display": target_ip_types_display(load_ui_config().get("target_ip_types") or TARGET_IP_TYPES_ENV or "residential"),
         },
     )
     threading.Thread(target=proxy_server.start_proxy_server, args=(LOCAL_PROXY_HOST, LOCAL_PROXY_PORT), daemon=True).start()
