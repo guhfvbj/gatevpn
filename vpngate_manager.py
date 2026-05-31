@@ -35,6 +35,11 @@ import vpn_utils
 import proxy_server
 
 API_URL = "https://www.vpngate.net/api/iphone/"
+VPNBOOK_OPENVPN_URL = os.environ.get("VPNBOOK_OPENVPN_URL", "https://www.vpnbook.com/freevpn/openvpn")
+NODE_SOURCES_ENV = os.environ.get("NODE_SOURCES") or os.environ.get("VPN_NODE_SOURCES") or ""
+# 默认启用 VPNGate + VPNBook；可在面板里调整为 vpngate / vpnbook / vpngate,vpnbook。
+DEFAULT_NODE_SOURCES = os.environ.get("DEFAULT_NODE_SOURCES", "vpngate,vpnbook")
+VPNBOOK_PROTOCOLS = os.environ.get("VPNBOOK_PROTOCOLS", "tcp443,tcp80,udp53,udp25000")
 FETCH_INTERVAL_SECONDS = int(os.environ.get("FETCH_INTERVAL_SECONDS", "960"))
 CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", "960"))
 TARGET_VALID_NODES = int(os.environ.get("TARGET_VALID_NODES", "3"))
@@ -163,7 +168,8 @@ def load_ui_config() -> dict[str, Any]:
             "port": 8787,
             "target_countries": TARGET_COUNTRIES_ENV,
             "target_ip_types": TARGET_IP_TYPES_ENV or "residential",
-            "auto_select_best_node": AUTO_SELECT_BEST_NODE
+            "auto_select_best_node": AUTO_SELECT_BEST_NODE,
+            "node_sources": NODE_SOURCES_ENV or DEFAULT_NODE_SOURCES
         }
         updated = False
         if auth_file.exists():
@@ -179,6 +185,8 @@ def load_ui_config() -> dict[str, Any]:
             config["target_ip_types"] = TARGET_IP_TYPES_ENV
         if AUTO_SELECT_BEST_NODE_ENV is not None and AUTO_SELECT_BEST_NODE_ENV.strip():
             config["auto_select_best_node"] = AUTO_SELECT_BEST_NODE
+        if NODE_SOURCES_ENV:
+            config["node_sources"] = NODE_SOURCES_ENV
         
         if not config.get("username"):
             config["username"] = generate_random_username()
@@ -219,6 +227,40 @@ def normalize_target_countries_input(value: Any) -> str:
             result.append(item)
             seen.add(token)
     return ",".join(result)
+
+
+def split_node_sources(value: Any) -> list[str]:
+    raw = str(value or "")
+    aliases = {
+        "vpngate": "vpngate", "vpn_gate": "vpngate", "gate": "vpngate", "vg": "vpngate", "筑波": "vpngate",
+        "vpnbook": "vpnbook", "book": "vpnbook", "vb": "vpnbook",
+    }
+    result: list[str] = []
+    seen: set[str] = set()
+    for part in re.split(r"[,，;；|/\s]+", raw):
+        token = part.strip().lower().replace("-", "_")
+        if not token:
+            continue
+        canonical = aliases.get(token, token)
+        if canonical in {"all", "全部", "*"}:
+            canonical = "vpngate,vpnbook"
+        for item in str(canonical).split(","):
+            item = item.strip()
+            if item in {"vpngate", "vpnbook"} and item not in seen:
+                result.append(item)
+                seen.add(item)
+    return result or ["vpngate", "vpnbook"]
+
+def normalize_node_sources_input(value: Any) -> str:
+    return ",".join(split_node_sources(value))
+
+def get_node_sources() -> list[str]:
+    cfg = load_ui_config()
+    return split_node_sources(NODE_SOURCES_ENV or cfg.get("node_sources") or DEFAULT_NODE_SOURCES)
+
+def node_sources_display(value: Any) -> str:
+    labels = {"vpngate": "VPNGate", "vpnbook": "VPNBook"}
+    return " + ".join(labels.get(x, x) for x in split_node_sources(value))
 
 def get_target_countries() -> list[str]:
     cfg = load_ui_config()
@@ -349,6 +391,7 @@ def row_country_tokens(row: dict[str, str]) -> set[str]:
         "CA": ["Canada", "加拿大"],
         "AU": ["Australia", "澳大利亚", "澳洲"],
         "RU": ["Russian Federation", "Russia", "Russian", "俄罗斯", "俄羅斯"],
+        "PL": ["Poland", "波兰", "波蘭"],
     }
     for code, aliases in alias_map.items():
         if country_short.upper() == code or country_long in aliases or country_zh in aliases:
@@ -392,6 +435,7 @@ def node_country_tokens(node: dict[str, Any]) -> set[str]:
         "CA": ["Canada", "加拿大"],
         "AU": ["Australia", "澳大利亚", "澳洲"],
         "RU": ["Russian Federation", "Russia", "Russian", "俄罗斯", "俄羅斯"],
+        "PL": ["Poland", "波兰", "波蘭"],
     }
     for code, aliases in alias_map.items():
         normalized_aliases = {normalize_country_token(x) for x in aliases}
@@ -849,6 +893,8 @@ def get_state() -> dict[str, Any]:
     state["target_countries_display"] = target_countries or "全部地区"
     state["target_ip_types"] = target_ip_types
     state["target_ip_types_display"] = target_ip_types_display(target_ip_types)
+    state["node_sources"] = normalize_node_sources_input(ui_cfg.get("node_sources") or NODE_SOURCES_ENV or DEFAULT_NODE_SOURCES)
+    state["node_sources_display"] = node_sources_display(state["node_sources"])
     state.setdefault("failover_country_short", "")
     state.setdefault("failover_country", "")
     state.setdefault("failover_country_display", target_countries or "未固定")
@@ -884,16 +930,34 @@ def parse_int(value: Any) -> int:
     except (TypeError, ValueError):
         return 0
 
-def fetch_api_text() -> str:
+def resolve_ip_for_risk(host: str) -> str:
+    host = str(host or "").strip()
+    if not host:
+        return ""
+    try:
+        socket.inet_aton(host)
+        return host
+    except OSError:
+        pass
+    try:
+        return socket.gethostbyname(host)
+    except Exception:
+        return host
+
+def http_get_bytes(url: str, timeout: int = 15, accept: str = "*/*") -> bytes:
     request = urllib.request.Request(
-        API_URL,
+        url,
         headers={
             "User-Agent": "Mozilla/5.0 eianun-vpngate-manager/2.0",
-            "Accept": "text/plain,*/*",
+            "Accept": accept,
+            "Referer": VPNBOOK_OPENVPN_URL if "vpnbook.com" in url else API_URL,
         },
     )
-    with urllib.request.urlopen(request, timeout=12) as response:
-        return response.read().decode("utf-8", errors="replace")
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return response.read()
+
+def fetch_api_text() -> str:
+    return http_get_bytes(API_URL, timeout=12, accept="text/plain,*/*").decode("utf-8", errors="replace")
 
 def parse_vpngate_rows(text: str) -> list[dict[str, str]]:
     lines = [line for line in text.splitlines() if line and not line.startswith("*")]
@@ -921,9 +985,12 @@ def row_to_node(row: dict[str, str], config_text: str) -> dict[str, Any]:
     country_zh = vpn_utils.COUNTRY_TRANSLATIONS.get(country_long, vpn_utils.COUNTRY_TRANSLATIONS.get(country_long.strip(), country_long))
     return {
         "id": node_id,
+        "source": "vpngate",
         "country": country_zh,
         "country_short": country_short,
         "host_name": row.get("HostName", ""),
+        "auth_user": OPENVPN_AUTH_USER,
+        "auth_pass": OPENVPN_AUTH_PASS,
         "ip": ip,
         "score": parse_int(row.get("Score")),
         "ping": parse_int(row.get("Ping")),
@@ -955,18 +1022,12 @@ def row_to_node(row: dict[str, str], config_text: str) -> dict[str, Any]:
         "probed_at": 0,
     }
 
-def fetch_candidates(target_override: list[str] | None = None) -> list[dict[str, Any]]:
-    blacklist = load_blacklist()
+def fetch_vpngate_candidates(target_countries: list[str], seen_keys: set[str]) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
-    seen_ips = set()
-    target_countries = target_override if target_override is not None else get_target_countries()
     target_display = normalize_target_countries_input(target_countries) or "全部地区"
-    
-    # 检查本地是否有节点缓存，以确定最大重试尝试次数
     has_cache = len(cached_nodes()) > 0
     max_attempts = 1 if has_cache else 2
-    
-    log_to_json("INFO", "Main", f"开始拉取官方 API 节点列表，地区过滤: {target_display} (最大尝试次数: {max_attempts})...")
+    log_to_json("INFO", "Main", f"开始拉取 VPNGate API 节点，地区过滤: {target_display} (最大尝试次数: {max_attempts})...")
     for i in range(max_attempts):
         if i > 0:
             time.sleep(1.5)
@@ -983,33 +1044,226 @@ def fetch_candidates(target_override: list[str] | None = None) -> list[dict[str,
                 if matched_rows > MAX_SCAN_ROWS:
                     break
                 ip = row.get("IP", "")
-                if not ip or ip in seen_ips:
+                if not ip or ip in seen_keys:
                     continue
                 encoded = row.get("OpenVPN_ConfigData_Base64", "")
                 if not encoded:
                     continue
                 config_text = decode_config(encoded)
                 node = row_to_node(row, config_text)
+                node["source"] = "vpngate"
                 candidates.append(node)
-                seen_ips.add(ip)
+                seen_keys.add(ip)
             if target_countries:
-                log_to_json("INFO", "Main", f"地区过滤 {target_display}: 匹配 {matched_rows} 行，跳过 {filtered_rows} 行")
+                log_to_json("INFO", "Main", f"VPNGate 地区过滤 {target_display}: 匹配 {matched_rows} 行，跳过 {filtered_rows} 行")
+            break
         except Exception as e:
-            print(f"[fetch_candidates] Fetch {i+1} failed: {e}", flush=True)
-            log_to_json("WARNING", "Main", f"第 {i+1} 次拉取 API 节点失败: {e}")
-            if i == max_attempts - 1 and not candidates:
-                log_to_json("ERROR", "Main", f"获取官方 API 节点失败: {e}")
-                raise
-                
+            print(f"[fetch_vpngate_candidates] Fetch {i+1} failed: {e}", flush=True)
+            log_to_json("WARNING", "Main", f"第 {i+1} 次拉取 VPNGate 节点失败: {e}")
+            if i == max_attempts - 1:
+                log_to_json("ERROR", "Main", f"VPNGate 节点拉取失败: {e}")
+    return candidates
+
+VPNBOOK_COUNTRIES: dict[str, tuple[str, str]] = {
+    "us": ("US", "United States"),
+    "ca": ("CA", "Canada"),
+    "uk": ("GB", "United Kingdom"),
+    "gb": ("GB", "United Kingdom"),
+    "de": ("DE", "Germany"),
+    "fr": ("FR", "France"),
+    "pl": ("PL", "Poland"),
+}
+
+def vpnbook_protocol_parts(proto_name: str) -> tuple[str, int, str]:
+    token = str(proto_name or "").strip().lower().replace("_", "").replace("-", "")
+    if token in {"tcp443", "443", "tcp"}:
+        return "tcp", 443, "tcp443"
+    if token in {"tcp80", "80"}:
+        return "tcp", 80, "tcp80"
+    if token in {"udp53", "53", "udp"}:
+        return "udp", 53, "udp53"
+    if token in {"udp25000", "25000"}:
+        return "udp", 25000, "udp25000"
+    m = re.match(r"^(tcp|udp)(\d+)$", token)
+    if m:
+        return m.group(1), int(m.group(2)), f"{m.group(1)}{m.group(2)}"
+    return "tcp", 443, "tcp443"
+
+def extract_vpnbook_credentials(page_text: str) -> tuple[str, str]:
+    username = "vpnbook"
+    password = ""
+    text = re.sub(r"<[^>]+>", " ", page_text)
+    text = re.sub(r"\s+", " ", text)
+    m_user = re.search(r"Username\s*(vpnbook)", text, re.I) or re.search(r"用户名\s*(vpnbook)", text, re.I)
+    if m_user:
+        username = m_user.group(1).strip()
+    m_pass = re.search(r"Password\s*([A-Za-z0-9]{4,32})", text, re.I) or re.search(r"密码\s*([A-Za-z0-9]{4,32})", text, re.I)
+    if m_pass:
+        password = m_pass.group(1).strip()
+    return username, password
+
+def fetch_vpnbook_page() -> str:
+    for url in [VPNBOOK_OPENVPN_URL, "https://www.vpnbook.com/zh/freevpn/openvpn"]:
+        try:
+            return http_get_bytes(url, timeout=15, accept="text/html,*/*").decode("utf-8", errors="replace")
+        except Exception as exc:
+            log_to_json("WARNING", "VPNBook", f"读取 VPNBook 页面失败 {url}: {exc}")
+    return ""
+
+def parse_vpnbook_servers(page_text: str) -> list[dict[str, str]]:
+    found: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for host in re.findall(r"\b((?:us|ca|uk|gb|de|fr|pl)\d+\.vpnbook\.com)\b", page_text, flags=re.I):
+        host = host.lower()
+        if host in seen:
+            continue
+        seen.add(host)
+        prefix_match = re.match(r"([a-z]+)", host)
+        prefix = prefix_match.group(1) if prefix_match else ""
+        country_short, country_long = VPNBOOK_COUNTRIES.get(prefix, (prefix.upper() or "XX", prefix.upper() or "Unknown"))
+        found.append({"host": host, "country_short": country_short, "country_long": country_long})
+    return found
+
+def try_download_vpnbook_config(host: str, proto_key: str) -> str:
+    short_host = host.split(".")[0].lower()
+    filename = f"vpnbook-{short_host}-{proto_key}.ovpn"
+    urls = [
+        f"https://www.vpnbook.com/freevpn/openvpn/{filename}",
+        f"https://www.vpnbook.com/freevpn/openvpn/download/{filename}",
+        f"https://www.vpnbook.com/free-openvpn-account/{filename}",
+        f"https://www.vpnbook.com/free-openvpn-account/{filename}?download=1",
+        f"https://www.vpnbook.com/{filename}",
+    ]
+    for url in urls:
+        try:
+            data = http_get_bytes(url, timeout=20, accept="application/x-openvpn-profile,text/plain,*/*")
+            text = data.decode("utf-8", errors="replace")
+            if "client" in text[:500].lower() and "remote" in text.lower() and "<ca>" in text.lower():
+                return text
+        except Exception:
+            continue
+    return ""
+
+def vpnbook_row_to_node(server: dict[str, str], proto_name: str, config_text: str, auth_user: str, auth_pass: str) -> dict[str, Any]:
+    host = server["host"]
+    proto, port, proto_key = vpnbook_protocol_parts(proto_name)
+    country_short = server.get("country_short") or "XX"
+    country_long = server.get("country_long") or country_short
+    country_zh = vpn_utils.COUNTRY_TRANSLATIONS.get(country_long, country_long)
+    # 确保 config 内写入当前选择的 remote/proto，并让 OpenVPN 使用统一认证文件。
+    text = config_text
+    text = re.sub(r"(?m)^proto\s+\S+", f"proto {proto}", text)
+    text = re.sub(r"(?m)^remote\s+\S+\s+\d+(?:\s+\S+)?", f"remote {host} {port}", text)
+    if re.search(r"(?m)^auth-user-pass(?:\s+.+)?$", text):
+        text = re.sub(r"(?m)^auth-user-pass(?:\s+.+)?$", "auth-user-pass", text)
+    else:
+        text = "auth-user-pass\n" + text
+    remote_host, remote_port, parsed_proto = vpn_utils.parse_remote(text, host)
+    node_id = safe_name("_".join(["VPNBOOK", country_short, host, str(remote_port or port), parsed_proto or proto]))
+    config_path = CONFIG_DIR / f"{node_id}.ovpn"
+    return {
+        "id": node_id,
+        "source": "vpnbook",
+        "country": country_zh,
+        "country_short": country_short,
+        "host_name": host,
+        "auth_user": auth_user or "vpnbook",
+        "auth_pass": auth_pass,
+        "ip": host,
+        "score": 0,
+        "ping": 0,
+        "speed": 0,
+        "sessions": 0,
+        "owner": "",
+        "asn": "",
+        "as_name": "",
+        "location": "",
+        "ip_type": "",
+        "quality": "",
+        "fraud_score": 0,
+        "clean_score": 0,
+        "risk_level": "unknown",
+        "fraud_flags": [],
+        "risk_sources": [],
+        "blacklist_hits": [],
+        "blacklist_count": 0,
+        "ip_clean": False,
+        "latency_ms": 0,
+        "config_file": str(config_path),
+        "config_text": text,
+        "proto": parsed_proto or proto,
+        "remote_host": remote_host or host,
+        "remote_port": remote_port or port,
+        "fetched_at": time.time(),
+        "probe_status": "not_checked",
+        "probe_message": f"VPNBook source; auth user {auth_user}; password auto-fetched" if auth_pass else "VPNBook source; password fetch failed",
+        "probed_at": 0,
+    }
+
+def fetch_vpnbook_candidates(target_countries: list[str], seen_keys: set[str]) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    page = fetch_vpnbook_page()
+    if not page:
+        return candidates
+    auth_user, auth_pass = extract_vpnbook_credentials(page)
+    if not auth_pass:
+        log_to_json("WARNING", "VPNBook", "未能从 VPNBook 页面解析到密码，VPNBook 节点可能无法通过认证")
+    servers = parse_vpnbook_servers(page)
+    protocols = [p for p in re.split(r"[,，;；\s]+", VPNBOOK_PROTOCOLS) if p.strip()] or ["tcp443"]
+    target_display = normalize_target_countries_input(target_countries) or "全部地区"
+    log_to_json("INFO", "VPNBook", f"解析到 VPNBook OpenVPN 服务器 {len(servers)} 个，地区过滤: {target_display}")
+    for server in servers:
+        pseudo_row = {"CountryShort": server.get("country_short", ""), "CountryLong": server.get("country_long", "")}
+        if not row_matches_target_countries(pseudo_row, target_countries):
+            continue
+        for proto_name in protocols:
+            proto, port, proto_key = vpnbook_protocol_parts(proto_name)
+            key = f"vpnbook:{server['host']}:{proto_key}"
+            if key in seen_keys:
+                continue
+            config_text = try_download_vpnbook_config(server["host"], proto_key)
+            if not config_text:
+                log_to_json("WARNING", "VPNBook", f"未能下载 VPNBook 配置: {server['host']} {proto_key}")
+                continue
+            node = vpnbook_row_to_node(server, proto_key, config_text, auth_user, auth_pass)
+            candidates.append(node)
+            seen_keys.add(key)
+            if len(candidates) >= MAX_SCAN_ROWS:
+                break
+        if len(candidates) >= MAX_SCAN_ROWS:
+            break
+    log_to_json("INFO", "VPNBook", f"成功获取 VPNBook 候选节点 {len(candidates)} 个")
+    return candidates
+
+def fetch_candidates(target_override: list[str] | None = None) -> list[dict[str, Any]]:
+    blacklist = load_blacklist()
+    candidates: list[dict[str, Any]] = []
+    seen_keys: set[str] = set()
+    target_countries = target_override if target_override is not None else get_target_countries()
+    target_display = normalize_target_countries_input(target_countries) or "全部地区"
+    sources = get_node_sources()
+    source_counts: dict[str, int] = {}
+    for source in sources:
+        before = len(candidates)
+        try:
+            if source == "vpngate":
+                candidates.extend(fetch_vpngate_candidates(target_countries, seen_keys))
+            elif source == "vpnbook":
+                candidates.extend(fetch_vpnbook_candidates(target_countries, seen_keys))
+        except Exception as exc:
+            log_to_json("ERROR", "Main", f"节点来源 {source} 拉取失败: {exc}")
+        source_counts[source] = len(candidates) - before
     set_state(
         last_fetch_at=time.time(),
-        last_fetch_status="ok",
-        last_fetch_message=f"地区 {target_display}: fetched {len(candidates)} unique candidates.",
+        last_fetch_status="ok" if candidates else "empty",
+        last_fetch_message=f"来源 {node_sources_display(','.join(sources))}，地区 {target_display}: fetched {len(candidates)} candidates. {source_counts}",
         blacklisted_nodes=len(blacklist),
         target_countries=normalize_target_countries_input(target_countries),
         target_countries_display=target_display,
+        node_sources=normalize_node_sources_input(','.join(sources)),
+        node_sources_display=node_sources_display(','.join(sources)),
     )
-    log_to_json("INFO", "Main", f"成功获取官方 API 节点，地区 {target_display}，共 {len(candidates)} 个候选节点")
+    log_to_json("INFO", "Main", f"成功获取候选节点 {len(candidates)} 个，来源 {source_counts}，地区 {target_display}")
     return candidates
 
 def cached_nodes() -> list[dict[str, Any]]:
@@ -1033,7 +1287,22 @@ def get_openvpn_version() -> float:
     _openvpn_version = 2.4
     return _openvpn_version
 
-def openvpn_command(config_file: str, route_nopull: bool, dev: str = "tun0") -> list[str]:
+def auth_file_for_node(node: dict[str, Any] | None) -> Path:
+    ensure_dirs()
+    if not node:
+        return AUTH_FILE
+    user = str(node.get("auth_user") or OPENVPN_AUTH_USER or "vpn")
+    pwd = str(node.get("auth_pass") or OPENVPN_AUTH_PASS or "vpn")
+    node_id = safe_name(str(node.get("id") or node.get("remote_host") or "node"))
+    path = CONFIG_DIR / f"{node_id}.auth"
+    try:
+        path.write_text(f"{user}\n{pwd}\n", encoding="utf-8")
+        path.chmod(0o600)
+    except Exception:
+        return AUTH_FILE
+    return path
+
+def openvpn_command(config_file: str, route_nopull: bool, dev: str = "tun0", auth_file: str | Path | None = None) -> list[str]:
     command = shlex.split(OPENVPN_CMD, posix=False) or ["openvpn"]
     command.extend(
         [
@@ -1056,7 +1325,7 @@ def openvpn_command(config_file: str, route_nopull: bool, dev: str = "tun0") -> 
             "--connect-timeout",
             "15",
             "--auth-user-pass",
-            str(AUTH_FILE),
+            str(auth_file or AUTH_FILE),
             "--auth-nocache",
         ]
     )
@@ -1122,11 +1391,11 @@ def update_handshake_status(line_lower: str) -> None:
             set_state(active_node_latency=short_status, last_check_message=detailed_desc)
             break
 
-def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bool, timeout: int | None = None, dev: str = "tun0") -> tuple[bool, str, subprocess.Popen[str] | None]:
+def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bool, timeout: int | None = None, dev: str = "tun0", auth_file: str | Path | None = None) -> tuple[bool, str, subprocess.Popen[str] | None]:
     limit = timeout if timeout is not None else OPENVPN_TEST_TIMEOUT_SECONDS
     try:
         process = subprocess.Popen(
-            openvpn_command(config_file, route_nopull, dev),
+            openvpn_command(config_file, route_nopull, dev, auth_file=auth_file),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -1309,7 +1578,7 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
     
     idx = get_free_test_index()
     try:
-        ok, message, _ = run_openvpn_until_ready(config_file, keep_alive=False, route_nopull=True, timeout=12, dev=f"tun{idx}")
+        ok, message, _ = run_openvpn_until_ready(config_file, keep_alive=False, route_nopull=True, timeout=12, dev=f"tun{idx}", auth_file=auth_file_for_node(node))
     finally:
         release_test_index(idx)
     
@@ -1319,9 +1588,10 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
     except Exception:
         pass
 
+    risk_ip = resolve_ip_for_risk(h)
     temp_node = {
         "id": node_id,
-        "ip": h,
+        "ip": risk_ip,
         "remote_host": h,
         "remote_port": p,
         "owner": "",
@@ -1409,6 +1679,7 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
                 route_nopull=True,
                 timeout=OPENVPN_BATCH_TEST_TIMEOUT_SECONDS,
                 dev=f"tun{idx}",
+                auth_file=auth_file_for_node(n_info),
             )
         finally:
             release_test_index(idx)
@@ -1442,7 +1713,7 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
         }
         if ok:
             ip_to_enrich = {
-                "ip": n_info.get("ip"),
+                "ip": resolve_ip_for_risk(h),
                 "remote_host": h,
                 "owner": "",
                 "asn": "",
@@ -1618,7 +1889,7 @@ def connect_node(node_id: str, update_failover_scope: bool = True, allow_manual_
             raise RuntimeError(f"Failed to write configuration: {e}")
 
         set_state(active_node_latency="启动核心", last_check_message="正在启动 OpenVPN Core 核心服务并建立连接...")
-        ok, message, process = run_openvpn_until_ready(str(node["config_file"]), keep_alive=True, route_nopull=True)
+        ok, message, process = run_openvpn_until_ready(str(node["config_file"]), keep_alive=True, route_nopull=True, auth_file=auth_file_for_node(node))
         if not ok or process is None:
             try:
                 if config_path.exists():
@@ -3066,7 +3337,7 @@ INDEX_HTML = r"""<!doctype html>
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px;">
         <h3 style="margin: 0; font-size: 18px; font-weight: 700; color: var(--text-primary); display: flex; align-items: center; gap: 8px;">
           <svg xmlns="http://www.w3.org/2000/svg" style="width:20px; height:20px; color: var(--primary);" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" /><path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
-          面板设置（账号 / 密码 / 端口 / 地区）
+          面板设置（账号 / 密码 / 端口 / 来源 / 地区）
         </h3>
         <button type="button" onclick="closeSettingsModal()" style="background: transparent; border: none; padding: 4px; cursor: pointer; color: var(--text-secondary); width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; border-radius: 50%;" onmouseover="this.style.background='rgba(255,255,255,0.05)'" onmouseout="this.style.background='transparent'">
           <svg xmlns="http://www.w3.org/2000/svg" style="width:18px; height:18px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
@@ -3092,8 +3363,18 @@ INDEX_HTML = r"""<!doctype html>
 
           <div class="form-group" style="margin-bottom: 12px;">
             <label class="form-label" for="settings_target_countries">拉取地区过滤 (留空 = 全部地区)</label>
-            <input type="text" id="settings_target_countries" class="input-field" placeholder="例如：JP,日本,US,美国">
+            <input type="text" id="settings_target_countries" class="input-field" placeholder="例如：JP,日本,US,美国,GB,英国">
             <div style="font-size: 12px; color: var(--text-secondary); margin-top: 6px; line-height: 1.4;">支持国家简称、英文名或中文名，多个地区用逗号分隔。保存后会按指定地区重新拉取节点。</div>
+          </div>
+
+          <div class="form-group" style="margin-bottom: 12px;">
+            <label class="form-label" for="settings_node_sources">节点来源</label>
+            <select id="settings_node_sources" class="input-field">
+              <option value="vpngate,vpnbook">VPNGate + VPNBook（推荐）</option>
+              <option value="vpngate">仅 VPNGate</option>
+              <option value="vpnbook">仅 VPNBook</option>
+            </select>
+            <div style="font-size: 12px; color: var(--text-secondary); margin-top: 6px; line-height: 1.4;">VPNBook 当前页面列出 US/CA/UK/DE/FR 等 OpenVPN 服务器，密码会自动从官网页面读取；如果官网改版导致配置下载失败，会自动跳过该来源。</div>
           </div>
 
           <div class="form-group" style="margin-bottom: 12px;">
@@ -3338,7 +3619,7 @@ function getFilteredNodes() {
     const searchStr = [
       n.country, n.country_short, n.ip, n.remote_host, n.proto,
       translateQuality(n.quality), translateIpType(n.ip_type), translateRiskLevel(n.risk_level),
-      n.location, n.owner, n.as_name, n.fraud_score, n.clean_score,
+      n.source, n.location, n.owner, n.as_name, n.fraud_score, n.clean_score,
       (n.fraud_flags || []).join(" "), (n.blacklist_hits || []).join(" ")
     ].join(" ").toLowerCase();
     return searchStr.includes(q);
@@ -3443,7 +3724,8 @@ function render(){
   const targetInfo = state.target_countries_display || state.target_countries || "全部地区";
   const ipTypeInfo = state.target_ip_types_display || "住宅IP";
   const failoverInfo = state.failover_country_display || targetInfo || "未固定";
-  $("status").innerHTML=`<span class="status-dot"></span>HTTP 代理本地接口：http://127.0.0.1:7928 | 拉取地区：${esc(targetInfo)} | 自动IP优先级：${esc(ipTypeInfo)} | 故障转移地区：${esc(failoverInfo)} | 活动节点：${activeNodeInfo} | 状态：${statusMessage}`;
+  const sourceInfo = state.node_sources_display || state.node_sources || "VPNGate + VPNBook";
+  $("status").innerHTML=`<span class="status-dot"></span>HTTP 代理本地接口：http://127.0.0.1:7928 | 来源：${esc(sourceInfo)} | 拉取地区：${esc(targetInfo)} | 自动IP优先级：${esc(ipTypeInfo)} | 故障转移地区：${esc(failoverInfo)} | 活动节点：${activeNodeInfo} | 状态：${statusMessage}`;
   
   // Update proxy test status card based on background checks
   const pBadge = $("proxy_status_badge");
@@ -3545,7 +3827,7 @@ function render(){
       return `<tr ${rowClass}>
         <td><span class="badge ${badgeClass}">${badgeText}</span></td>
         <td>${latencyText}</td>
-        <td class="mono">${esc(n.ip||n.remote_host)}:${n.remote_port||""}</td>
+        <td class="mono">${esc(n.ip||n.remote_host)}:${n.remote_port||""}<br><span style="font-size:11px; color:var(--text-secondary);">来源：${esc((n.source || "vpngate").toUpperCase())}</span></td>
         <td>${esc(displayLocation)}</td>
         <td class="mono" style="font-size:12px; color:var(--text-secondary);">${esc(n.asn||"-")}</td>
         <td>${esc(n.owner||n.as_name||"-")}</td>
@@ -3946,6 +4228,7 @@ function openSettingsModal() {
     $("settings_port").value = state.port || 8787;
     $("settings_suffix").value = state.secret_path || "EJsW2EeBo9lY";
     $("settings_target_countries").value = state.target_countries || "";
+    $("settings_node_sources").value = state.node_sources || "vpngate,vpnbook";
     const ipTypeValue = state.target_ip_types || "residential";
     const legacyIpTypeMap = {
       "residential,mobile": "residential",
@@ -3975,6 +4258,7 @@ async function saveSettings(e) {
   const port = parseInt($("settings_port").value);
   const suffix = $("settings_suffix").value.trim();
   const targetCountries = $("settings_target_countries").value.trim();
+  const nodeSources = $("settings_node_sources").value.trim();
   const targetIpTypes = $("settings_target_ip_types").value.trim();
   const autoSelectBestNode = $("settings_auto_select_best_node").value === "1";
   const newUsername = $("settings_new_username").value.trim();
@@ -4005,6 +4289,7 @@ async function saveSettings(e) {
         port: port,
         secret_path: suffix,
         target_countries: targetCountries,
+        node_sources: nodeSources,
         target_ip_types: targetIpTypes,
         auto_select_best_node: autoSelectBestNode,
         new_username: newUsername,
@@ -4424,6 +4709,7 @@ class Handler(BaseHTTPRequestHandler):
                 new_port = payload.get("port")
                 new_suffix = str(payload.get("secret_path") or "").strip()
                 new_target_countries = normalize_target_countries_input(payload.get("target_countries") or "")
+                new_node_sources = normalize_node_sources_input(payload.get("node_sources") or NODE_SOURCES_ENV or DEFAULT_NODE_SOURCES)
                 new_target_ip_types = normalize_target_ip_types_input(payload.get("target_ip_types") or TARGET_IP_TYPES_ENV or "residential")
                 new_auto_select_best_node = parse_bool_setting(payload.get("auto_select_best_node"), True)
                 new_username = str(payload.get("new_username") or "").strip()
@@ -4456,6 +4742,7 @@ class Handler(BaseHTTPRequestHandler):
                 ui_cfg["port"] = new_port_int
                 ui_cfg["secret_path"] = new_suffix
                 ui_cfg["target_countries"] = new_target_countries
+                ui_cfg["node_sources"] = new_node_sources
                 ui_cfg["target_ip_types"] = new_target_ip_types
                 ui_cfg["auto_select_best_node"] = new_auto_select_best_node
                 if new_username:

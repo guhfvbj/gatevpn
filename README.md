@@ -1,15 +1,16 @@
 # Eianun免费聚合落地IP 🌐
 
-基于 VPNGate + OpenVPN 的 Linux VPS 出站代理网关二改版。此版本已去除原项目广告入口，新增指定地区拉取、同地区故障转移、IP 类型优先级与自动兜底。
+基于 VPNGate / VPNBook + OpenVPN 的 Linux VPS 出站代理网关二改版。此版本已去除原项目广告入口，新增多来源节点拉取、指定地区拉取、同地区故障转移、IP 类型优先级与自动兜底。
 
 ## 主要改动
 
 - 名称统一改为 **Eianun免费聚合落地IP**。
 - 移除 Web UI 里的 VPS 推广广告和 README 中的推广徽章/链接。
-- 新增后端节点地区过滤：可只保留指定国家/地区的 VPNGate 节点，不再默认把全部地区节点都写入节点池。
-- Web 管理后台“管理员设置”新增 **拉取地区过滤** 输入框。
+- 新增多节点来源：默认同时拉取 **VPNGate + VPNBook**；也可在面板里切换为仅 VPNGate 或仅 VPNBook。
+- 新增后端节点地区过滤：可只保留指定国家/地区节点，不再默认把全部地区节点都写入节点池。
+- Web 管理后台“管理员设置”新增 **节点来源** 和 **拉取地区过滤** 配置。
 - 安装后的主命令改为 `en`，同时保留 `eianun` 兼容别名，安装时会删除旧 `ml`。
-- 安装脚本已适配主流 Linux 包管理器：APT、DNF、YUM、Pacman、Zypper。
+- 安装脚本已适配主流 Linux 包管理器：APT、DNF、YUM、Pacman、Zypper、APK、XBPS、Emerge。
 
 ## 支持系统
 
@@ -22,8 +23,11 @@
 - Fedora 等 DNF 系。
 - Arch Linux / Manjaro 等 Pacman 系。
 - openSUSE / SUSE 等 Zypper 系。
+- Alpine Linux / APK / OpenRC。
+- Void Linux / XBPS。
+- Gentoo / Emerge。
 
-注意：本项目仍依赖 **systemd** 管理后台服务。如果系统没有 `systemctl`，安装脚本会直接提示不支持。
+服务管理器支持：`systemd`、`OpenRC`、`runit`。极简容器或裁剪系统如果没有 TUN、OpenVPN 或服务管理器，脚本会提示缺失项。
 
 ## 快速安装
 
@@ -41,7 +45,7 @@ Alpine Linux 也可以直接使用上面的 `sh` 命令；脚本会通过 `apk` 
 也可以在安装时指定仓库用户和仓库名：
 
 ```bash
-bash install.sh illria gatevpn
+sh install.sh illria gatevpn
 ```
 
 ## 安装脚本依赖检测
@@ -55,6 +59,35 @@ bash install.sh illria gatevpn
 5. 安装后再次检测必要工具：`openvpn`、`curl`、`git`、`systemctl`、`ip`、`ping`、`iptables`、`pkill`、`Python`。
 
 RHEL / CentOS / Rocky / AlmaLinux 等系统会尝试自动安装 `epel-release`，方便安装 OpenVPN。如果你的镜像源没有 EPEL，需要先手动启用 EPEL。
+
+## 节点来源与指定地区拉取
+
+默认来源为：
+
+```text
+vpngate,vpnbook
+```
+
+可以在 Web 管理后台修改：
+
+```text
+管理员 → 面板设置 → 节点来源
+```
+
+也可以命令行修改：
+
+```bash
+en source
+```
+
+或写入 `/etc/default/eianun-vpngate`：
+
+```bash
+NODE_SOURCES=vpngate,vpnbook
+# 可选：vpngate / vpnbook / vpngate,vpnbook
+```
+
+VPNBook 当前免费 OpenVPN 页面提供 US、CA、UK、DE、FR 等服务器，并展示通用账号密码；程序会自动抓取页面中的服务器和密码，再下载 `.ovpn` 配置。VPNBook 官网页面显示 OpenVPN 支持 TCP 443、TCP 80、UDP 53、UDP 25000 这些协议选项。
 
 ## 指定地区拉取节点
 
@@ -71,7 +104,7 @@ JP,日本,US,美国
 
 设置方式：
 
-1. Web 管理后台 → 管理员 → 管理员设置 → 拉取地区过滤。
+1. Web 管理后台 → 管理员 → 面板设置 → 节点来源 / 拉取地区过滤。
 2. 命令行执行：
 
 ```bash
@@ -82,6 +115,7 @@ en country
 
 ```bash
 VPNGATE_TARGET_COUNTRIES=JP,日本
+NODE_SOURCES=vpngate,vpnbook
 
 # 自动连接/故障转移 IP 类型优先级：默认住宅优先
 # 可选 residential / mobile / normal / hosting / proxy / all
@@ -106,7 +140,7 @@ TARGET_IP_TYPES=residential
 STRICT_COUNTRY_FAILOVER=0
 ```
 
-注意：VPNGate 节点由第三方志愿节点提供，住宅/机房/代理类型识别依赖公开 IP 数据源，不能保证 100% 准确，但会作为自动切换的优先级依据。
+注意：VPNGate 节点由第三方志愿者提供；VPNBook 节点由 VPNBook 官网提供。住宅/机房/代理类型识别依赖公开 IP 数据源，不能保证 100% 准确，但会作为自动切换的优先级依据。
 
 ## 常用命令
 
@@ -119,6 +153,7 @@ en logs        # 查看日志
 en web         # 修改网页绑定地址/安全后缀
 en port        # 修改网页端口
 en password    # 修改管理账号密码
+en source      # 设置节点来源：VPNGate / VPNBook
 en country     # 设置节点拉取地区
 en iptype      # 设置自动选择/故障转移 IP 类型，例如住宅IP
 en update      # 从 GitHub 拉取最新代码并重新安装/重启
@@ -133,7 +168,7 @@ en uninstall   # 卸载
 [ 3x-ui / Xray ]
       │ HTTP / SOCKS5
       ▼
-[ 本地代理服务器 :7928 ] --绑定 tun0--> [ OpenVPN / VPNGate 节点 ]
+[ 本地代理服务器 :7928 ] --绑定 tun0--> [ OpenVPN / VPNGate 或 VPNBook 节点 ]
       │
       └─ SSH / Web UI 仍走物理网卡，避免 VPS 失联
 ```

@@ -341,7 +341,7 @@ def generate_random_suffix():
 def load_ui_cfg():
     import json
     path = "/opt/eianun-vpngate/vpngate_data/ui_auth.json"
-    cfg = {"host": "0.0.0.0", "port": 8787, "secret_path": "EJsW2EeBo9lY", "password": "", "target_countries": "", "target_ip_types": "residential"}
+    cfg = {"host": "0.0.0.0", "port": 8787, "secret_path": "EJsW2EeBo9lY", "password": "", "target_countries": "", "target_ip_types": "residential", "node_sources": "vpngate,vpnbook"}
     if os.path.exists(path):
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -553,6 +553,7 @@ def print_status():
     curr_pwd = cfg.get("password", "")
     masked_pwd = curr_pwd if len(curr_pwd) <= 4 else curr_pwd[:3] + "********" + curr_pwd[-2:]
     print_line(format_line("网页管理密码", masked_pwd))
+    print_line(format_line("节点拉取来源", cfg.get("node_sources", "vpngate,vpnbook") or "vpngate,vpnbook"))
     print_line(format_line("节点拉取地区", cfg.get("target_countries", "") or "全部地区"))
     print_line(format_line("自动IP优先级", cfg.get("target_ip_types", "residential") or "全部类型"))
     print_line()
@@ -839,6 +840,31 @@ def configure_credentials():
             break
 
 
+def configure_source():
+    cfg = load_ui_cfg()
+    current = cfg.get('node_sources', 'vpngate,vpnbook') or 'vpngate,vpnbook'
+    print("\033[H\033[J", end="")
+    print("=======================================================")
+    print("                    节点来源配置                       ")
+    print("=======================================================")
+    print(f"当前节点来源: {current}")
+    print("  [1] VPNGate + VPNBook（推荐）")
+    print("  [2] 仅 VPNGate")
+    print("  [3] 仅 VPNBook")
+    print("  [4] 返回主菜单")
+    key = getch()
+    if key == '1':
+        cfg['node_sources'] = 'vpngate,vpnbook'
+    elif key == '2':
+        cfg['node_sources'] = 'vpngate'
+    elif key == '3':
+        cfg['node_sources'] = 'vpnbook'
+    else:
+        return
+    save_ui_cfg(cfg)
+    print(f"节点来源已更新为: {cfg['node_sources']}")
+    ask_restart()
+
 def configure_country():
     cfg = load_ui_cfg()
     print("\033[H\033[J", end="")
@@ -991,12 +1017,14 @@ def main():
             configure_port()
         elif cmd == "password":
             configure_credentials()
+        elif cmd == "source":
+            configure_source()
         elif cmd == "country":
             configure_country()
         elif cmd in ("iptype", "ip-type", "type"):
             configure_iptype()
         else:
-            print("未知命令。可用命令: start, stop, restart, status, logs, update, uninstall, web, port, password, country, iptype")
+            print("未知命令。可用命令: start, stop, restart, status, logs, update, uninstall, web, port, password, source, country, iptype")
         sys.exit(0)
         
     options = {
@@ -1007,10 +1035,11 @@ def main():
         '5': ("网页配置 (en web)", configure_web),
         '6': ("端口配置 (en port)", configure_port),
         '7': ("账号密码 (en password)", configure_credentials),
-        '8': ("地区过滤 (en country)", configure_country),
-        '9': ("自动IP类型 (en iptype)", configure_iptype),
-        '0': ("一键更新 (en update)", update_service),
-        'a': ("完全卸载 (en uninstall)", uninstall_service),
+        '8': ("节点来源 (en source)", configure_source),
+        '9': ("地区过滤 (en country)", configure_country),
+        'a': ("自动IP类型 (en iptype)", configure_iptype),
+        'u': ("一键更新 (en update)", update_service),
+        'x': ("完全卸载 (en uninstall)", uninstall_service),
         '0': ("退出终端", None)
     }
     
@@ -1036,7 +1065,7 @@ def main():
                     print_line(f"  {green}[{key}]{reset} {name}")
                 print_line(f"  {green}[0]{reset} {options['0'][0]}")
                 print_line("=======================================================")
-                print("请直接输入数字键 [0-9/a] 快速选择执行：\033[K", end="", flush=True)
+                print("请直接输入数字键 [0-9/a/u/x] 快速选择执行：\033[K", end="", flush=True)
                 print("\033[J", end="", flush=True)
                 last_state = current_state
                 
@@ -1073,7 +1102,7 @@ def main():
                     print(f"执行出错: {e}")
                     
                 if func not in (start_service, stop_service, restart_service,
-                                configure_web, configure_port, configure_credentials, configure_country, configure_iptype, show_logs, update_service):
+                                configure_web, configure_port, configure_credentials, configure_source, configure_country, configure_iptype, show_logs, update_service):
                     input("\n操作已完成，按回车键返回主菜单...")
                     
                 # Re-enter alternate buffer and hide cursor
@@ -1136,6 +1165,7 @@ ${YELLOW}是否需要自定义配置网页面板参数？${PLAIN}"
 say "  -> 当前端口: ${GREEN}${UI_PORT}${PLAIN}"
 say "  -> 当前账号: ${GREEN}${UI_USERNAME}${PLAIN}"
 say "  -> 当前安全后缀: ${GREEN}${SECRET_PATH}${PLAIN}"
+say "  -> 当前节点来源: ${GREEN}${NODE_SOURCES_INPUT:-vpngate,vpnbook}${PLAIN}"
 say "  -> 当前拉取地区: ${GREEN}${TARGET_COUNTRIES_INPUT:-全部地区}${PLAIN}"
 say "  -> 当前自动IP类型: ${GREEN}${TARGET_IP_TYPES_INPUT:-residential}${PLAIN}"
 ask "是否现在配置端口/安全后缀/登录账号密码/拉取地区/IP类型？[y/N]: "
@@ -1190,6 +1220,7 @@ cfg = {
     'username': os.environ.get('UI_USERNAME') or 'admin',
     'password': os.environ.get('UI_PASSWORD') or 'admin',
     'target_countries': os.environ.get('TARGET_COUNTRIES_INPUT') or '',
+    'node_sources': os.environ.get('NODE_SOURCES_INPUT') or 'vpngate,vpnbook',
     'target_ip_types': os.environ.get('TARGET_IP_TYPES_INPUT') or 'residential',
 }
 with open(os.environ['AUTH_FILE'], 'w', encoding='utf-8') as f:
@@ -1267,6 +1298,7 @@ say "  * 快速状态指令:   ${YELLOW}en status${PLAIN}  兼容旧命令  ${YE
 say "  * 查看实时日志:   ${YELLOW}en logs${PLAIN}"
 say "  * 停止服务:       ${YELLOW}en stop${PLAIN}"
 say "  * 重启服务:       ${YELLOW}en restart${PLAIN}"
+say "  * 设置节点来源:   ${YELLOW}en source${PLAIN}"
 say "  * 设置拉取地区:   ${YELLOW}en country${PLAIN}"
 say "  * 设置自动IP类型: ${YELLOW}en iptype${PLAIN}"
 say "=========================================================="
