@@ -2602,16 +2602,17 @@ LOGIN_HTML = r"""<!DOCTYPE html>
   <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
   <style>
     :root {
-      --bg-dark: #090d16;
-      --bg-surface: rgba(15, 23, 42, 0.45);
-      --border-color: rgba(255, 255, 255, 0.08);
-      --text-primary: #f8fafc;
-      --text-secondary: #94a3b8;
-      --primary: #6366f1;
-      --primary-gradient: linear-gradient(135deg, #6366f1 0%, #4f46e5 100%);
-      --primary-hover: linear-gradient(135deg, #4f46e5 0%, #3730a3 100%);
-      --success: #10b981;
-      --danger: #f43f5e;
+      --bg-dark: #060b12;
+      --bg-surface: rgba(13, 20, 32, 0.72);
+      --border-color: rgba(136, 171, 206, 0.16);
+      --text-primary: #f3f8fe;
+      --text-secondary: #9fb0c4;
+      --primary: #84bff1;
+      --primary-gradient: linear-gradient(135deg, #9ed1fb 0%, #78b6eb 100%);
+      --primary-hover: linear-gradient(135deg, #8fc8f6 0%, #5f99c7 100%);
+      --success: #49c6a1;
+      --danger: #ef6a7b;
+      --accent: #f0c255;
     }
 
     body {
@@ -2620,8 +2621,9 @@ LOGIN_HTML = r"""<!DOCTYPE html>
       font-family: 'Outfit', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
       background-color: var(--bg-dark);
       background-image: 
-        radial-gradient(at 0% 0%, rgba(99, 102, 241, 0.15) 0px, transparent 50%),
-        radial-gradient(at 100% 0%, rgba(16, 185, 129, 0.08) 0px, transparent 50%);
+        radial-gradient(at 0% 0%, rgba(132, 191, 241, 0.18) 0px, transparent 46%),
+        radial-gradient(at 100% 0%, rgba(240, 194, 85, 0.09) 0px, transparent 44%),
+        radial-gradient(at 50% 100%, rgba(73, 198, 161, 0.05) 0px, transparent 50%);
       height: 100vh;
       display: flex;
       align-items: center;
@@ -2651,8 +2653,8 @@ LOGIN_HTML = r"""<!DOCTYPE html>
     .brand-logo {
       width: 64px;
       height: 64px;
-      background: rgba(99, 102, 241, 0.1);
-      border: 1px solid rgba(99, 102, 241, 0.25);
+      background: rgba(132, 191, 241, 0.10);
+      border: 1px solid rgba(132, 191, 241, 0.24);
       border-radius: 16px;
       display: flex;
       align-items: center;
@@ -2668,7 +2670,7 @@ LOGIN_HTML = r"""<!DOCTYPE html>
       width: 100%;
       height: 100%;
       border-radius: 16px;
-      border: 1px solid var(--success);
+      border: 1px solid rgba(240, 194, 85, 0.9);
       opacity: 0.5;
       animation: ripple 2s infinite ease-out;
     }
@@ -2682,6 +2684,7 @@ LOGIN_HTML = r"""<!DOCTYPE html>
       font-size: 24px;
       font-weight: 700;
       color: var(--text-primary);
+      text-shadow: 0 6px 20px rgba(132, 191, 241, 0.18);
       margin: 0 0 8px 0;
       letter-spacing: 0.5px;
     }
@@ -2727,8 +2730,8 @@ LOGIN_HTML = r"""<!DOCTYPE html>
 
     .input-field:focus {
       border-color: var(--primary);
-      box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.2);
-      background: rgba(15, 23, 42, 0.6);
+      box-shadow: 0 0 0 3px rgba(132, 191, 241, 0.18);
+      background: rgba(10, 18, 30, 0.68);
     }
 
     .error-message {
@@ -2757,13 +2760,13 @@ LOGIN_HTML = r"""<!DOCTYPE html>
       align-items: center;
       justify-content: center;
       gap: 8px;
-      box-shadow: 0 4px 12px rgba(99, 102, 241, 0.25);
+      box-shadow: 0 4px 12px rgba(132, 191, 241, 0.24);
     }
 
     .login-btn:hover {
       background: var(--primary-hover);
       transform: translateY(-1px);
-      box-shadow: 0 6px 16px rgba(99, 102, 241, 0.35);
+      box-shadow: 0 6px 16px rgba(132, 191, 241, 0.34);
     }
 
     .login-btn:active {
@@ -2796,8 +2799,8 @@ LOGIN_HTML = r"""<!DOCTYPE html>
       height: 8px;
       border-radius: 999px;
       overflow: hidden;
-      background: rgba(255, 255, 255, 0.06);
-      border: 1px solid rgba(255, 255, 255, 0.08);
+      background: rgba(152, 186, 220, 0.08);
+      border: 1px solid rgba(152, 186, 220, 0.10);
     }
 
     .login-progress-bar {
@@ -2941,24 +2944,25 @@ INDEX_HTML = r"""<!doctype html>
     @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
     
     :root {
-      --bg-dark: #0b0f19;
-      --bg-surface: rgba(22, 30, 49, 0.6);
-      --bg-surface-hover: rgba(30, 41, 67, 0.85);
-      --border-color: rgba(255, 255, 255, 0.08);
-      --border-color-hover: rgba(99, 102, 241, 0.35);
-      --text-primary: #f3f4f6;
-      --text-secondary: #9ca3af;
-      --primary: #6366f1;
-      --primary-gradient: linear-gradient(135deg, #6366f1 0%, #4f46e5 100%);
-      --primary-hover: linear-gradient(135deg, #4f46e5 0%, #3730a3 100%);
-      --success: #10b981;
-      --success-gradient: linear-gradient(135deg, #34d399 0%, #059669 100%);
-      --danger: #f43f5e;
-      --danger-gradient: linear-gradient(135deg, #fb7185 0%, #e11d48 100%);
-      --warning: #f59e0b;
-      --warning-gradient: linear-gradient(135deg, #fbbf24 0%, #d97706 100%);
-      --active-row-bg: rgba(16, 185, 129, 0.06);
-      --active-row-border: rgba(16, 185, 129, 0.25);
+      --bg-dark: #060b12;
+      --bg-surface: rgba(13, 20, 32, 0.78);
+      --bg-surface-hover: rgba(19, 30, 46, 0.96);
+      --border-color: rgba(136, 171, 206, 0.14);
+      --border-color-hover: rgba(132, 191, 241, 0.34);
+      --text-primary: #eef5fb;
+      --text-secondary: #9fb0c4;
+      --primary: #84bff1;
+      --primary-gradient: linear-gradient(135deg, #9ed1fb 0%, #78b6eb 100%);
+      --primary-hover: linear-gradient(135deg, #8fc8f6 0%, #5f99c7 100%);
+      --success: #49c6a1;
+      --success-gradient: linear-gradient(135deg, #65d7b4 0%, #2ea884 100%);
+      --danger: #ef6a7b;
+      --danger-gradient: linear-gradient(135deg, #ff8fa0 0%, #d94c62 100%);
+      --warning: #f0c255;
+      --warning-gradient: linear-gradient(135deg, #f5cf6a 0%, #dca63b 100%);
+      --active-row-bg: rgba(132, 191, 241, 0.08);
+      --active-row-border: rgba(132, 191, 241, 0.24);
+      --accent: #f0c255;
     }
 
     body {
@@ -2966,9 +2970,9 @@ INDEX_HTML = r"""<!doctype html>
       font-family: 'Outfit', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
       background-color: var(--bg-dark);
       background-image: 
-        radial-gradient(at 0% 0%, rgba(99, 102, 241, 0.15) 0px, transparent 50%),
-        radial-gradient(at 100% 0%, rgba(16, 185, 129, 0.08) 0px, transparent 50%),
-        radial-gradient(at 50% 100%, rgba(79, 70, 229, 0.05) 0px, transparent 50%);
+        radial-gradient(at 0% 0%, rgba(132, 191, 241, 0.18) 0px, transparent 44%),
+        radial-gradient(at 100% 0%, rgba(240, 194, 85, 0.08) 0px, transparent 42%),
+        radial-gradient(at 50% 100%, rgba(73, 198, 161, 0.05) 0px, transparent 48%);
       background-attachment: fixed;
       color: var(--text-primary);
       min-height: 100vh;
@@ -2977,7 +2981,7 @@ INDEX_HTML = r"""<!doctype html>
 
     header {
       padding: 16px 32px;
-      background: rgba(11, 15, 25, 0.7);
+      background: rgba(7, 12, 20, 0.78);
       backdrop-filter: blur(20px);
       -webkit-backdrop-filter: blur(20px);
       border-bottom: 1px solid var(--border-color);
@@ -2999,7 +3003,7 @@ INDEX_HTML = r"""<!doctype html>
       font-size: 20px;
       font-weight: 700;
       margin: 0;
-      background: linear-gradient(135deg, #a5b4fc 0%, #6366f1 100%);
+      background: linear-gradient(135deg, #eef7ff 0%, #84bff1 60%, #f0c255 100%);
       -webkit-background-clip: text;
       -webkit-text-fill-color: transparent;
       letter-spacing: -0.5px;
@@ -3044,12 +3048,12 @@ INDEX_HTML = r"""<!doctype html>
       align-items: center;
       justify-content: center;
       gap: 6px;
-      background: rgba(255, 255, 255, 0.04);
+      background: rgba(255, 255, 255, 0.03);
       color: var(--text-primary);
     }
 
     button:hover {
-      background: rgba(255, 255, 255, 0.08);
+      background: rgba(152, 186, 220, 0.10);
       border-color: rgba(255, 255, 255, 0.15);
       transform: translateY(-1px);
     }
@@ -3058,12 +3062,12 @@ INDEX_HTML = r"""<!doctype html>
       background: var(--primary-gradient);
       color: white;
       border: none;
-      box-shadow: 0 4px 12px rgba(99, 102, 241, 0.2);
+      box-shadow: 0 4px 12px rgba(132, 191, 241, 0.18);
     }
 
     .btn-primary:hover {
       background: var(--primary-hover);
-      box-shadow: 0 6px 16px rgba(99, 102, 241, 0.35);
+      box-shadow: 0 6px 16px rgba(132, 191, 241, 0.34);
     }
 
     .btn-danger {
@@ -3092,17 +3096,17 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     .active-card {
-      background: linear-gradient(135deg, rgba(99, 102, 241, 0.12) 0%, rgba(79, 70, 229, 0.04) 100%);
+      background: linear-gradient(135deg, rgba(132, 191, 241, 0.14) 0%, rgba(79, 70, 229, 0.04) 100%);
       backdrop-filter: blur(20px);
       -webkit-backdrop-filter: blur(20px);
-      border: 1px solid rgba(99, 102, 241, 0.25);
+      border: 1px solid rgba(132, 191, 241, 0.24);
       border-radius: 16px;
       padding: 24px;
       display: flex;
       justify-content: space-between;
       align-items: center;
       gap: 24px;
-      box-shadow: 0 8px 32px rgba(99, 102, 241, 0.12);
+      box-shadow: 0 8px 32px rgba(132, 191, 241, 0.14);
       transition: all 0.3s ease;
       width: 100%;
       box-sizing: border-box;
@@ -3176,7 +3180,7 @@ INDEX_HTML = r"""<!doctype html>
       background: var(--bg-surface-hover);
       border-color: var(--border-color-hover);
       transform: translateY(-2px);
-      box-shadow: 0 8px 24px rgba(99, 102, 241, 0.1);
+      box-shadow: 0 8px 24px rgba(132, 191, 241, 0.10);
     }
 
     .stat-info {
@@ -3204,11 +3208,11 @@ INDEX_HTML = r"""<!doctype html>
       width: 44px;
       height: 44px;
       border-radius: 10px;
-      background: rgba(255, 255, 255, 0.04);
+      background: rgba(255, 255, 255, 0.03);
       display: flex;
       align-items: center;
       justify-content: center;
-      border: 1px solid rgba(255, 255, 255, 0.06);
+      border: 1px solid rgba(152, 186, 220, 0.08);
     }
 
     .stat-icon {
@@ -3252,8 +3256,8 @@ INDEX_HTML = r"""<!doctype html>
 
     .toolbar select:focus {
       border-color: var(--primary);
-      box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.2);
-      background: #0f172a;
+      box-shadow: 0 0 0 2px rgba(132, 191, 241, 0.18);
+      background: #0b1421;
     }
 
     .toolbar input {
@@ -3273,8 +3277,8 @@ INDEX_HTML = r"""<!doctype html>
     .toolbar input:focus {
       outline: none;
       border-color: var(--primary);
-      box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.2);
-      background: rgba(15, 23, 42, 0.8);
+      box-shadow: 0 0 0 2px rgba(132, 191, 241, 0.18);
+      background: rgba(10, 18, 30, 0.86);
     }
 
     .table-wrapper {
@@ -3384,7 +3388,7 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     .current-badge {
-      background: rgba(99, 102, 241, 0.15);
+      background: rgba(132, 191, 241, 0.16);
       color: #818cf8;
       border-color: rgba(99, 102, 241, 0.3);
     }
@@ -3509,7 +3513,7 @@ INDEX_HTML = r"""<!doctype html>
       right: 0;
       margin-top: 6px;
       min-width: 140px;
-      background: rgba(22, 30, 49, 0.95);
+      background: rgba(13, 21, 34, 0.96);
       border: 1px solid var(--border-color);
       border-radius: 8px;
       box-shadow: 0 10px 25px rgba(0,0,0,0.5);
@@ -3530,7 +3534,7 @@ INDEX_HTML = r"""<!doctype html>
       transition: background 0.2s;
     }
     .dropdown-content a:hover {
-      background: rgba(255,255,255,0.08);
+      background: rgba(152,186,220,0.10);
     }
     
     /* Modal styles */
@@ -3544,7 +3548,7 @@ INDEX_HTML = r"""<!doctype html>
       height: 100%;
       overflow-y: auto;
       overflow-x: hidden;
-      background-color: rgba(9, 13, 22, 0.7);
+      background-color: rgba(5, 10, 18, 0.74);
       backdrop-filter: blur(8px);
       -webkit-backdrop-filter: blur(8px);
       align-items: flex-start;
@@ -3568,13 +3572,13 @@ INDEX_HTML = r"""<!doctype html>
       box-sizing: border-box;
       animation: modalFadeIn 0.3s cubic-bezier(0.4, 0, 0.2, 1);
       scrollbar-width: thin;
-      scrollbar-color: rgba(99, 102, 241, 0.55) rgba(255, 255, 255, 0.06);
+      scrollbar-color: rgba(99, 102, 241, 0.55) rgba(152, 186, 220, 0.08);
     }
     .modal-content::-webkit-scrollbar {
       width: 8px;
     }
     .modal-content::-webkit-scrollbar-track {
-      background: rgba(255, 255, 255, 0.04);
+      background: rgba(255, 255, 255, 0.03);
       border-radius: 999px;
     }
     .modal-content::-webkit-scrollbar-thumb {
@@ -3651,8 +3655,8 @@ INDEX_HTML = r"""<!doctype html>
     }
     .input-field:focus {
       border-color: var(--primary);
-      box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.2);
-      background: rgba(15, 23, 42, 0.6);
+      box-shadow: 0 0 0 3px rgba(132, 191, 241, 0.18);
+      background: rgba(10, 18, 30, 0.68);
     }
 
 
@@ -3663,14 +3667,14 @@ INDEX_HTML = r"""<!doctype html>
       display: flex;
       align-items: center;
       justify-content: center;
-      background: rgba(9, 13, 22, 0.72);
+      background: rgba(5, 10, 18, 0.76);
       backdrop-filter: blur(10px);
       -webkit-backdrop-filter: blur(10px);
     }
 
     .page-loading-card {
       width: min(420px, calc(100vw - 48px));
-      background: rgba(22, 30, 49, 0.92);
+      background: rgba(13, 21, 34, 0.94);
       border: 1px solid var(--border-color);
       border-radius: 18px;
       padding: 24px;
@@ -3694,9 +3698,9 @@ INDEX_HTML = r"""<!doctype html>
     .page-loading-track {
       height: 9px;
       border-radius: 999px;
-      background: rgba(255, 255, 255, 0.06);
+      background: rgba(152, 186, 220, 0.08);
       overflow: hidden;
-      border: 1px solid rgba(255, 255, 255, 0.08);
+      border: 1px solid rgba(152, 186, 220, 0.10);
     }
 
     .page-loading-bar {
@@ -3745,7 +3749,7 @@ INDEX_HTML = r"""<!doctype html>
       立即检测补齐
     </button>
     <div class="dropdown">
-      <button id="admin_btn" class="btn-primary" style="background: rgba(255, 255, 255, 0.08); border: 1px solid var(--border-color); color: var(--text-primary);">
+      <button id="admin_btn" class="btn-primary" style="background: rgba(152, 186, 220, 0.10); border: 1px solid var(--border-color); color: var(--text-primary);">
         <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" /></svg>
         管理员
         <svg xmlns="http://www.w3.org/2000/svg" style="width:12px; height:12px; margin-left: 2px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3"><path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7" /></svg>
@@ -3803,7 +3807,7 @@ INDEX_HTML = r"""<!doctype html>
   <section class="proxy-test-section" style="margin-bottom: 24px;">
     <div class="stat" style="display: flex; flex-direction: row; justify-content: space-between; align-items: center; width: 100%; box-sizing: border-box; flex-wrap: wrap; gap: 16px;">
       <div style="display: flex; align-items: center; gap: 16px; flex-wrap: wrap;">
-        <div class="stat-icon-wrapper" style="background: rgba(99, 102, 241, 0.1); border-color: rgba(99, 102, 241, 0.2);">
+        <div class="stat-icon-wrapper" style="background: rgba(132, 191, 241, 0.10); border-color: rgba(132, 191, 241, 0.18);">
           <svg xmlns="http://www.w3.org/2000/svg" class="stat-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" style="color: var(--primary);"><path stroke-linecap="round" stroke-linejoin="round" d="M8.111 16.404a5.5 5.5 0 017.778 0M12 20h.01m-7.08-7.071a10.5 10.5 0 0114.14 0M1.414 8.05a16 16 0 0121.172 0" /></svg>
         </div>
         <div>
