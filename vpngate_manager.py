@@ -241,6 +241,86 @@ def split_target_countries(value: Any) -> list[str]:
 def normalize_country_token(value: Any) -> str:
     return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", str(value or "").strip().lower())
 
+
+COUNTRY_CANONICAL_ALIASES: dict[str, list[str]] = {
+    "US": ["United States", "USA", "United States of America", "America", "美国", "美國"],
+    "JP": ["Japan", "日本"],
+    "KR": ["Korea Republic of", "Korea", "Republic of Korea", "South Korea", "韩国", "韓國", "南韩", "南韓"],
+    "GB": ["United Kingdom", "UK", "Great Britain", "Britain", "England", "英国", "英國"],
+    "CA": ["Canada", "加拿大"],
+    "DE": ["Germany", "德国", "德國"],
+    "FR": ["France", "法国", "法國"],
+    "NL": ["Netherlands", "荷兰", "荷蘭"],
+    "RU": ["Russian Federation", "Russia", "Russian", "俄罗斯", "俄羅斯"],
+    "AU": ["Australia", "澳大利亚", "澳洲"],
+    "TW": ["Taiwan", "Taiwan Province of China", "台湾", "台灣"],
+    "HK": ["Hong Kong", "香港"],
+    "SG": ["Singapore", "新加坡"],
+    "TH": ["Thailand", "泰国", "泰國"],
+    "VN": ["Viet Nam", "Vietnam", "越南"],
+    "CN": ["China", "中国", "中國"],
+    "PL": ["Poland", "波兰", "波蘭"],
+    "RO": ["Romania", "罗马尼亚", "羅馬尼亞"],
+    "CO": ["Colombia", "哥伦比亚", "哥倫比亞"],
+    "ID": ["Indonesia", "印度尼西亚", "印尼"],
+    "PE": ["Peru", "秘鲁", "秘魯"],
+    "MM": ["Myanmar", "Burma", "缅甸", "緬甸"],
+    "IN": ["India", "印度"],
+    "MY": ["Malaysia", "马来西亚", "馬來西亞"],
+    "PH": ["Philippines", "菲律宾", "菲律賓"],
+    "BR": ["Brazil", "巴西"],
+    "AR": ["Argentina", "阿根廷"],
+    "CL": ["Chile", "智利"],
+    "MX": ["Mexico", "墨西哥"],
+    "ES": ["Spain", "西班牙"],
+    "IT": ["Italy", "意大利"],
+    "SE": ["Sweden", "瑞典"],
+    "NO": ["Norway", "挪威"],
+    "FI": ["Finland", "芬兰", "芬蘭"],
+    "DK": ["Denmark", "丹麦", "丹麥"],
+    "CH": ["Switzerland", "瑞士"],
+    "BE": ["Belgium", "比利时", "比利時"],
+    "AT": ["Austria", "奥地利", "奧地利"],
+    "IE": ["Ireland", "爱尔兰", "愛爾蘭"],
+    "PT": ["Portugal", "葡萄牙"],
+    "GR": ["Greece", "希腊", "希臘"],
+    "CZ": ["Czech Republic", "Czechia", "捷克"],
+    "HU": ["Hungary", "匈牙利"],
+    "TR": ["Turkey", "Türkiye", "土耳其"],
+    "UA": ["Ukraine", "乌克兰", "烏克蘭"],
+}
+COUNTRY_CODE_TO_EN: dict[str, str] = {code: aliases[0] for code, aliases in COUNTRY_CANONICAL_ALIASES.items()}
+_COUNTRY_ALIAS_INDEX: dict[str, str] = {}
+for _code, _aliases in COUNTRY_CANONICAL_ALIASES.items():
+    _COUNTRY_ALIAS_INDEX[normalize_country_token(_code)] = _code
+    for _alias in _aliases:
+        _COUNTRY_ALIAS_INDEX[normalize_country_token(_alias)] = _code
+
+def canonical_country_code(*values: Any) -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        token = normalize_country_token(text)
+        if token in _COUNTRY_ALIAS_INDEX:
+            return _COUNTRY_ALIAS_INDEX[token]
+        if len(text) == 2 and text.upper() in COUNTRY_CODE_TO_EN:
+            return text.upper()
+    return ""
+
+def canonical_country_display(country_short: Any = "", country_value: Any = "") -> str:
+    code = canonical_country_code(country_short, country_value)
+    if code:
+        english = COUNTRY_CODE_TO_EN.get(code, code)
+        return vpn_utils.COUNTRY_TRANSLATIONS.get(english, english)
+    country = str(country_value or "").strip()
+    return vpn_utils.COUNTRY_TRANSLATIONS.get(country, vpn_utils.COUNTRY_TRANSLATIONS.get(country.strip(), country))
+
+def canonicalize_country_fields(country_short: Any = "", country_value: Any = "") -> tuple[str, str]:
+    code = canonical_country_code(country_short, country_value)
+    display = canonical_country_display(code or country_short, country_value)
+    return code or str(country_short or "").strip(), display
+
 def normalize_target_countries_input(value: Any) -> str:
     # Accept ISO country codes (JP/US/KR), English names, or Chinese names.
     # Keep the saved value readable while deduplicating normalized tokens.
@@ -413,30 +493,10 @@ def row_country_tokens(row: dict[str, str]) -> set[str]:
     country_short = (row.get("CountryShort") or "").strip()
     country_zh = vpn_utils.COUNTRY_TRANSLATIONS.get(country_long, vpn_utils.COUNTRY_TRANSLATIONS.get(country_long.strip(), country_long))
     tokens = {country_short, country_long, country_zh}
-    # Common VPNGate/country aliases for convenience.
-    alias_map = {
-        "JP": ["Japan", "日本"],
-        "KR": ["Korea Republic of", "Korea", "Republic of Korea", "韩国", "南韩"],
-        "US": ["United States", "USA", "United States of America", "美国"],
-        "GB": ["United Kingdom", "UK", "Great Britain", "英国"],
-        "TW": ["Taiwan", "台湾", "台灣"],
-        "HK": ["Hong Kong", "香港"],
-        "SG": ["Singapore", "新加坡"],
-        "TH": ["Thailand", "泰国", "泰國"],
-        "VN": ["Viet Nam", "Vietnam", "越南"],
-        "CN": ["China", "中国", "中國"],
-        "DE": ["Germany", "德国", "德國"],
-        "FR": ["France", "法国", "法國"],
-        "NL": ["Netherlands", "荷兰", "荷蘭"],
-        "CA": ["Canada", "加拿大"],
-        "AU": ["Australia", "澳大利亚", "澳洲"],
-        "RU": ["Russian Federation", "Russia", "Russian", "俄罗斯", "俄羅斯"],
-        "PL": ["Poland", "波兰", "波蘭"],
-    }
-    for code, aliases in alias_map.items():
-        if country_short.upper() == code or country_long in aliases or country_zh in aliases:
-            tokens.add(code)
-            tokens.update(aliases)
+    code = canonical_country_code(country_short, country_long, country_zh)
+    if code:
+        tokens.add(code)
+        tokens.update(COUNTRY_CANONICAL_ALIASES.get(code, []))
     return {normalize_country_token(token) for token in tokens if token}
 
 def row_matches_target_countries(row: dict[str, str], targets: list[str]) -> bool:
@@ -458,30 +518,10 @@ def node_country_tokens(node: dict[str, Any]) -> set[str]:
     reverse_translations = {normalize_country_token(v): k for k, v in vpn_utils.COUNTRY_TRANSLATIONS.items()}
     if normalize_country_token(country) in reverse_translations:
         tokens.add(reverse_translations[normalize_country_token(country)])
-    alias_map = {
-        "JP": ["Japan", "日本"],
-        "KR": ["Korea Republic of", "Korea", "Republic of Korea", "韩国", "南韩"],
-        "US": ["United States", "USA", "United States of America", "美国"],
-        "GB": ["United Kingdom", "UK", "Great Britain", "英国"],
-        "TW": ["Taiwan", "台湾", "台灣"],
-        "HK": ["Hong Kong", "香港"],
-        "SG": ["Singapore", "新加坡"],
-        "TH": ["Thailand", "泰国", "泰國"],
-        "VN": ["Viet Nam", "Vietnam", "越南"],
-        "CN": ["China", "中国", "中國"],
-        "DE": ["Germany", "德国", "德國"],
-        "FR": ["France", "法国", "法國"],
-        "NL": ["Netherlands", "荷兰", "荷蘭"],
-        "CA": ["Canada", "加拿大"],
-        "AU": ["Australia", "澳大利亚", "澳洲"],
-        "RU": ["Russian Federation", "Russia", "Russian", "俄罗斯", "俄羅斯"],
-        "PL": ["Poland", "波兰", "波蘭"],
-    }
-    for code, aliases in alias_map.items():
-        normalized_aliases = {normalize_country_token(x) for x in aliases}
-        if country_short.upper() == code or normalize_country_token(country) in normalized_aliases:
-            tokens.add(code)
-            tokens.update(aliases)
+    code = canonical_country_code(country_short, country)
+    if code:
+        tokens.add(code)
+        tokens.update(COUNTRY_CANONICAL_ALIASES.get(code, []))
     return {normalize_country_token(token) for token in tokens if token}
 
 def node_matches_target_countries(node: dict[str, Any], targets: list[str]) -> bool:
@@ -1285,7 +1325,7 @@ def vpnbook_row_to_node(server: dict[str, str], proto_name: str, config_text: st
     proto, port, proto_key = vpnbook_protocol_parts(proto_name)
     country_short = server.get("country_short") or "XX"
     country_long = server.get("country_long") or country_short
-    country_zh = vpn_utils.COUNTRY_TRANSLATIONS.get(country_long, country_long)
+    country_short, country_zh = canonicalize_country_fields(country_short, country_long)
     # 确保 config 内写入当前选择的 remote/proto，并让 OpenVPN 使用统一认证文件。
     text = sanitize_openvpn_config_for_eianun(config_text)
     text = re.sub(r"(?m)^proto\s+\S+", f"proto {proto}", text)
@@ -1382,7 +1422,7 @@ IPSPEED_COUNTRY_CODES: dict[str, str] = {
 
 def ipspeed_country_code(country_name: str) -> str:
     name = re.sub(r"\s+", " ", str(country_name or "").strip())
-    return IPSPEED_COUNTRY_CODES.get(name.lower(), name[:2].upper() if name else "XX")
+    return canonical_country_code(name) or IPSPEED_COUNTRY_CODES.get(name.lower(), name[:2].upper() if name else "XX")
 
 def parse_ipspeed_rows(page_text: str) -> list[dict[str, Any]]:
     """Parse IPSpeed free OpenVPN table rows.
@@ -1461,7 +1501,7 @@ def ipspeed_row_to_node(row: dict[str, Any], config_text: str) -> dict[str, Any]
     ip = str(row.get("ip") or "")
     country_long = str(row.get("country_long") or "Unknown")
     country_short = str(row.get("country_short") or ipspeed_country_code(country_long) or "XX")
-    country_zh = vpn_utils.COUNTRY_TRANSLATIONS.get(country_long, country_long)
+    country_short, country_zh = canonicalize_country_fields(country_short, country_long)
     text = sanitize_openvpn_config_for_eianun(config_text)
     remote_host, remote_port, proto = vpn_utils.parse_remote(text, ip)
     if not remote_host:
@@ -4029,6 +4069,9 @@ const translateCountry = c => {
     "Republic of Korea": "韩国",
     "Thailand": "泰国",
     "United States": "美国",
+    "United States of America": "美国",
+    "USA": "美国",
+    "America": "美国",
     "United Kingdom": "英国",
     "Russian Federation": "俄罗斯",
     "Russian": "俄罗斯",
@@ -4107,7 +4150,7 @@ function getLatencyClass(ms) {
 function updateCountryFilter() {
   const select = $("country_filter");
   const selectedValue = select.value;
-  const countries = Array.from(new Set(nodes.map(n => n.country).filter(Boolean))).sort();
+  const countries = Array.from(new Set(nodes.map(n => translateCountry(n.country)).filter(Boolean))).sort();
   
   const currentOptions = Array.from(select.options).map(o => o.value).filter(Boolean);
   if (JSON.stringify(countries) === JSON.stringify(currentOptions)) {
@@ -4139,7 +4182,7 @@ function getFilteredNodes() {
   const selectedCountry = $("country_filter").value;
   const selectedIpType = $("ip_type_filter").value;
   return nodes.filter(n => {
-    if (selectedCountry && n.country !== selectedCountry) {
+    if (selectedCountry && translateCountry(n.country) !== selectedCountry) {
       return false;
     }
     if (selectedIpType && ![canonicalIpType(n.ip_type), canonicalIpType(n.quality)].includes(selectedIpType)) {
@@ -5148,6 +5191,11 @@ class Handler(BaseHTTPRequestHandler):
             stripped_nodes = []
             for n in nodes:
                 stripped = n.copy()
+                norm_short, norm_country = canonicalize_country_fields(stripped.get("country_short"), stripped.get("country"))
+                if norm_country:
+                    stripped["country"] = norm_country
+                if norm_short:
+                    stripped["country_short"] = norm_short
                 if "config_text" in stripped:
                     del stripped["config_text"]
                 stripped_nodes.append(stripped)
