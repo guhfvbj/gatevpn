@@ -87,7 +87,7 @@ NODE_SOURCES=vpngate,vpnbook
 # 可选：vpngate / vpnbook / vpngate,vpnbook
 ```
 
-VPNBook 当前免费 OpenVPN 页面提供 US、CA、UK、DE、FR 等服务器，并展示通用账号密码；程序会自动抓取页面中的服务器和密码，再下载 `.ovpn` 配置。VPNBook 官网页面显示 OpenVPN 支持 TCP 443、TCP 80、UDP 53、UDP 25000 这些协议选项。
+VPNBook 当前免费 OpenVPN 页面提供 US、CA、UK、DE、FR 等服务器，并展示通用账号密码；程序会自动抓取页面中的服务器和密码，再下载 `.ovpn` 配置。VPNBook 官网页面显示 OpenVPN 支持 TCP 443、TCP 80、UDP 53、UDP 25000 这些协议选项。若 VPNBook 官网下载端点临时变化导致 `.ovpn` 直链失败，程序会使用公开 OpenVPN 模板替换当前服务器与协议后继续生成候选节点，避免 VPNBook 来源直接归零。
 
 ## 指定地区拉取节点
 

@@ -36,6 +36,11 @@ import proxy_server
 
 API_URL = "https://www.vpngate.net/api/iphone/"
 VPNBOOK_OPENVPN_URL = os.environ.get("VPNBOOK_OPENVPN_URL", "https://www.vpnbook.com/freevpn/openvpn")
+VPNBOOK_TEMPLATE_OVPN_URLS = os.environ.get(
+    "VPNBOOK_TEMPLATE_OVPN_URLS",
+    "https://raw.githubusercontent.com/Sadaqaty/VPNed-Wifi-Access-Point/refs/heads/main/vpnbook-openvpn-us16/vpnbook-us16-tcp443.ovpn"
+)
+_vpnbook_template_config_cache = ""
 NODE_SOURCES_ENV = os.environ.get("NODE_SOURCES") or os.environ.get("VPN_NODE_SOURCES") or ""
 # 默认启用 VPNGate + VPNBook；可在面板里调整为 vpngate / vpnbook / vpngate,vpnbook。
 DEFAULT_NODE_SOURCES = os.environ.get("DEFAULT_NODE_SOURCES", "vpngate,vpnbook")
@@ -1124,24 +1129,74 @@ def parse_vpnbook_servers(page_text: str) -> list[dict[str, str]]:
         found.append({"host": host, "country_short": country_short, "country_long": country_long})
     return found
 
+def looks_like_openvpn_config(text: str) -> bool:
+    lower = (text or "").lower()
+    return "client" in lower[:800] and "remote" in lower and ("<ca>" in lower or "-----begin certificate-----" in lower)
+
+def normalize_vpnbook_config_text(config_text: str, host: str, proto: str, port: int) -> str:
+    text = config_text.replace("\r\n", "\n").replace("\r", "\n").strip() + "\n"
+    text = re.sub(r"(?m)^proto\s+\S+", f"proto {proto}", text)
+    if re.search(r"(?m)^remote\s+\S+\s+\d+(?:\s+\S+)?", text):
+        text = re.sub(r"(?m)^remote\s+\S+\s+\d+(?:\s+\S+)?", f"remote {host} {port}", text, count=1)
+    else:
+        text = f"remote {host} {port}\n" + text
+    if re.search(r"(?m)^auth-user-pass(?:\s+.+)?$", text):
+        text = re.sub(r"(?m)^auth-user-pass(?:\s+.+)?$", "auth-user-pass", text, count=1)
+    else:
+        text = "auth-user-pass\n" + text
+    return text
+
+def fetch_vpnbook_template_config() -> str:
+    global _vpnbook_template_config_cache
+    if _vpnbook_template_config_cache:
+        return _vpnbook_template_config_cache
+    urls = [u.strip() for u in re.split(r"[,，;；\s]+", VPNBOOK_TEMPLATE_OVPN_URLS or "") if u.strip()]
+    for url in urls:
+        try:
+            text = http_get_bytes(url, timeout=20, accept="application/x-openvpn-profile,text/plain,*/*").decode("utf-8", errors="replace")
+            if looks_like_openvpn_config(text):
+                _vpnbook_template_config_cache = text
+                log_to_json("INFO", "VPNBook", f"已加载 VPNBook 模板配置: {url}")
+                return text
+            log_to_json("WARNING", "VPNBook", f"VPNBook 模板不像有效 OpenVPN 配置: {url}")
+        except Exception as exc:
+            log_to_json("WARNING", "VPNBook", f"加载 VPNBook 模板失败 {url}: {exc}")
+    return ""
+
 def try_download_vpnbook_config(host: str, proto_key: str) -> str:
     short_host = host.split(".")[0].lower()
-    filename = f"vpnbook-{short_host}-{proto_key}.ovpn"
+    proto, port, normalized_proto_key = vpnbook_protocol_parts(proto_key)
+    filename = f"vpnbook-{short_host}-{normalized_proto_key}.ovpn"
+    quoted_host = urllib.parse.quote(short_host)
+    quoted_proto = urllib.parse.quote(normalized_proto_key)
+    # VPNBook 现在的页面是“选择服务器 + 协议后下载”，页面结构会变化；
+    # 这里先尝试多个常见官方下载路径，失败时再用公开模板配置替换 remote/proto。
     urls = [
         f"https://www.vpnbook.com/freevpn/openvpn/{filename}",
         f"https://www.vpnbook.com/freevpn/openvpn/download/{filename}",
         f"https://www.vpnbook.com/free-openvpn-account/{filename}",
         f"https://www.vpnbook.com/free-openvpn-account/{filename}?download=1",
+        f"https://www.vpnbook.com/openvpn/{filename}",
         f"https://www.vpnbook.com/{filename}",
+        f"https://www.vpnbook.com/freevpn/openvpn/download?server={quoted_host}&protocol={quoted_proto}",
+        f"https://www.vpnbook.com/freevpn/openvpn/download?server={quoted_host}.vpnbook.com&protocol={quoted_proto}",
+        f"https://www.vpnbook.com/api/openvpn/config?server={quoted_host}&protocol={quoted_proto}",
     ]
     for url in urls:
         try:
-            data = http_get_bytes(url, timeout=20, accept="application/x-openvpn-profile,text/plain,*/*")
+            data = http_get_bytes(url, timeout=20, accept="application/x-openvpn-profile,text/plain,application/octet-stream,*/*")
             text = data.decode("utf-8", errors="replace")
-            if "client" in text[:500].lower() and "remote" in text.lower() and "<ca>" in text.lower():
-                return text
+            if looks_like_openvpn_config(text):
+                return normalize_vpnbook_config_text(text, host, proto, port)
+            if text.strip().lower().startswith("<!doctype") or "<html" in text[:500].lower():
+                continue
         except Exception:
             continue
+
+    template = fetch_vpnbook_template_config()
+    if template:
+        log_to_json("WARNING", "VPNBook", f"官方配置下载失败，使用 VPNBook 模板生成配置: {host} {normalized_proto_key}")
+        return normalize_vpnbook_config_text(template, host, proto, port)
     return ""
 
 def vpnbook_row_to_node(server: dict[str, str], proto_name: str, config_text: str, auth_user: str, auth_pass: str) -> dict[str, Any]:
