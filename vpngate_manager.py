@@ -2278,6 +2278,54 @@ def run_remaining_tests_background(node_ids: list[str]) -> None:
 
     threading.Thread(target=worker, daemon=True).start()
 
+
+def run_vpnbook_safe_tests_background(node_ids: list[str]) -> None:
+    """Safely classify VPNBook nodes without starting OpenVPN.
+
+    VPNBook nodes are intentionally excluded from automatic OpenVPN batch tests because some
+    downloaded/template configs can destabilize VPS routing. This background pass only performs
+    TCP reachability and IP risk enrichment, so the panel no longer keeps VPNBook rows stuck at
+    "未检" after 更新节点.
+    """
+    node_ids = [str(x) for x in node_ids if x]
+    if not node_ids:
+        return
+
+    def worker() -> None:
+        total = len(node_ids)
+        done = 0
+        set_state(
+            last_check_message=f"正在后台安全检测 VPNBook 节点 0/{total}：仅检测 TCP 可达和 IP 风控，不会断开当前连接...",
+            vpnbook_safe_test_total=total,
+            vpnbook_safe_test_done=0,
+        )
+        for node_id in node_ids:
+            try:
+                with lock:
+                    nodes = read_json(NODES_FILE, [])
+                    node = next((item for item in nodes if item.get("id") == node_id), None)
+                if node and str(node.get("source") or "").lower() == "vpnbook":
+                    safe_test_vpnbook_node_by_id(node_id, node)
+            except Exception as exc:
+                with lock:
+                    nodes = read_json(NODES_FILE, [])
+                    for item in nodes:
+                        if item.get("id") == node_id:
+                            item["probe_status"] = "unavailable"
+                            item["probe_message"] = f"VPNBook 安全检测异常：{exc}"
+                            item["probed_at"] = time.time()
+                            break
+                    write_json(NODES_FILE, sort_all_nodes(nodes))
+            done += 1
+            set_state(
+                last_check_message=f"正在后台安全检测 VPNBook 节点 {done}/{total}：仅检测 TCP 可达和 IP 风控，不会断开当前连接...",
+                vpnbook_safe_test_total=total,
+                vpnbook_safe_test_done=done,
+            )
+        set_state(last_check_message=f"VPNBook 安全检测完成：已更新 {total} 个节点状态；当前连接保持不变。")
+
+    threading.Thread(target=worker, daemon=True).start()
+
 def auto_switch_node(attempt: int = 0) -> None:
     if attempt >= 3:
         print("[自动切换] 连续切换失败已达 3 次，停止切换以防止主线程死锁，将在后台重新加载节点...", flush=True)
@@ -2547,15 +2595,19 @@ def maintain_valid_nodes(force: bool = False, target_override: list[str] | None 
             selected_sources = get_node_sources()
             vpnbook_only = selected_sources == ["vpnbook"]
             skipped_vpnbook_auto = 0
+            safe_vpnbook_ids: list[str] = []
             if VPNBOOK_AUTO_TEST:
                 test_candidates = raw_test_candidates
             elif vpnbook_only:
                 vpnbook_candidates = [n for n in raw_test_candidates if n.get("source") == "vpnbook"]
                 test_candidates = vpnbook_candidates[:VPNBOOK_ONLY_SAFE_AUTO_TEST_LIMIT]
+                safe_vpnbook_ids = [n["id"] for n in vpnbook_candidates[VPNBOOK_ONLY_SAFE_AUTO_TEST_LIMIT:]]
                 skipped_vpnbook_auto = max(0, len(vpnbook_candidates) - len(test_candidates))
             else:
                 test_candidates = [n for n in raw_test_candidates if n.get("source") != "vpnbook"]
-                skipped_vpnbook_auto = len(raw_test_candidates) - len(test_candidates)
+                vpnbook_candidates = [n for n in raw_test_candidates if n.get("source") == "vpnbook"]
+                safe_vpnbook_ids = [n["id"] for n in vpnbook_candidates]
+                skipped_vpnbook_auto = len(vpnbook_candidates)
 
             if AUTO_TEST_ALL_NODES:
                 to_test = test_candidates
@@ -2571,7 +2623,7 @@ def maintain_valid_nodes(force: bool = False, target_override: list[str] | None 
             rest_test_ids = [n["id"] for n in rest_test]
             to_test_ids = sync_test_ids + rest_test_ids
 
-        vpnbook_skip_note = f"，已跳过 VPNBook 自动批测 {skipped_vpnbook_auto} 个" if skipped_vpnbook_auto else ""
+        vpnbook_skip_note = f"，VPNBook {skipped_vpnbook_auto} 个转安全检测" if skipped_vpnbook_auto else ""
         print(f"[维护线程] 首批检测节点: {len(sync_test_ids)}/{len(to_test_ids)}，剩余 {len(rest_test_ids)} 个转后台{vpnbook_skip_note}，并发 {min(AUTO_TEST_WORKERS, max(1, len(sync_test_ids)))}", flush=True)
         set_state(
             is_connecting=True,
@@ -2580,11 +2632,16 @@ def maintain_valid_nodes(force: bool = False, target_override: list[str] | None 
             auto_test_done=0,
             auto_test_workers=min(AUTO_TEST_WORKERS, max(1, len(sync_test_ids))) if sync_test_ids else 0,
             vpnbook_auto_skipped=skipped_vpnbook_auto,
+            vpnbook_safe_test_total=len(safe_vpnbook_ids),
+            vpnbook_safe_test_done=0,
         )
         if sync_test_ids:
             test_multiple_nodes(sync_test_ids, progress_prefix="正在检测首批节点")
         elif skipped_vpnbook_auto:
-            set_state(last_check_message=f"VPNBook 节点已加入节点池，但默认不启动批量检测；请在面板单个检测，或设置 VPNBOOK_AUTO_TEST=1 后再启用自动检测。")
+            set_state(last_check_message=f"VPNBook 节点已加入节点池，正在后台做安全检测：只测 TCP 可达和 IP 风控，不会启动 OpenVPN。")
+
+        if safe_vpnbook_ids:
+            run_vpnbook_safe_tests_background(safe_vpnbook_ids)
         
         is_connecting = False
         
@@ -3948,7 +4005,7 @@ INDEX_HTML = r"""<!doctype html>
     </button>
     <button id="check" class="btn-primary">
       <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 1121.21 8H18.5" /></svg>
-      立即检测补齐
+      非中断检测补齐
     </button>
     <div class="dropdown">
       <button id="admin_btn" class="btn-primary" style="background: rgba(152, 186, 220, 0.10); border: 1px solid var(--border-color); color: var(--text-primary);">
@@ -4941,7 +4998,7 @@ $("check").onclick=async()=>{
   $("check").disabled=true; 
   $("check").textContent="检测中..."; 
   try{await fetch("./api/check",{method:"POST"}); await load();} 
-  finally{$("check").disabled=false; $("check").textContent="立即检测补齐";}
+  finally{$("check").disabled=false; $("check").textContent="非中断检测补齐";}
 };
 $("btn_test_proxy").onclick = async () => {
   const btn = $("btn_test_proxy");
@@ -5572,8 +5629,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if effective_path == "/api/check":
             try:
-                threading.Thread(target=maintain_valid_nodes, kwargs={"force": True}, daemon=True).start()
-                self.send_json({"ok": True, "message": "已在后台启动完整节点检测流程，面板会持续刷新检测进度"})
+                threading.Thread(target=maintain_valid_nodes, kwargs={"force": False}, daemon=True).start()
+                self.send_json({"ok": True, "message": "已在后台启动非中断节点检测流程，当前连接会保持不变，面板会持续刷新检测进度"})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/refresh_nodes":
