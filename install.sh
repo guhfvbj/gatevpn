@@ -1258,6 +1258,12 @@ while [ "$i" -le 90 ]; do
                 break
             else
                 if [ -n "$CUR_MSG" ] && [ "$CUR_MSG" != "$LAST_MSG" ]; then say "  -> 提示: ${YELLOW}${CUR_MSG}${PLAIN}"; LAST_MSG="$CUR_MSG"; fi
+                case "$CUR_MSG" in
+                    *后台*|*Fetched*|*首批节点*)
+                        say "  -> ${YELLOW}[后台运行]${PLAIN} 节点检测/优选会继续在后台进行，安装流程先完成。"
+                        break
+                        ;;
+                esac
             fi
         else
             if [ -n "$CUR_MSG" ] && [ "$CUR_MSG" != "$LAST_MSG" ]; then say "  -> 状态: ${YELLOW}${CUR_MSG}${PLAIN}"; LAST_MSG="$CUR_MSG"; fi

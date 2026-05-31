@@ -85,6 +85,9 @@ STRICT_IP_TYPE_FILTER = os.environ.get("STRICT_IP_TYPE_FILTER", "0").strip().low
 AUTO_TEST_ALL_NODES = os.environ.get("AUTO_TEST_ALL_NODES", "1").strip().lower() not in {"0", "false", "no", "off"}
 AUTO_TEST_MAX_NODES = int(os.environ.get("AUTO_TEST_MAX_NODES", "0"))  # 0 = 不额外限制，最多受 MAX_SCAN_ROWS 影响
 AUTO_TEST_WORKERS = max(1, int(os.environ.get("AUTO_TEST_WORKERS", "8")))
+# 首次启动/更新时先同步检测少量节点，避免安装脚本和面板长时间停在 0/N。
+# 剩余节点会转入后台继续检测，并在检测完成后参与自动优选。
+AUTO_TEST_INITIAL_BATCH = max(1, int(os.environ.get("AUTO_TEST_INITIAL_BATCH", "8")))
 OPENVPN_BATCH_TEST_TIMEOUT_SECONDS = int(os.environ.get("OPENVPN_BATCH_TEST_TIMEOUT_SECONDS", "12"))
 
 # 自动优选策略：全部节点检测完成后，主动从已检测可用节点中按地区、IP类型、风控、延迟重新选择更优节点。
@@ -1597,6 +1600,8 @@ def sort_all_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 active_test_indexes = set()
 test_indexes_lock = threading.Lock()
+auto_test_background_lock = threading.Lock()
+auto_test_background_running = False
 
 def get_free_test_index() -> int:
     with test_indexes_lock:
@@ -1692,7 +1697,23 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
         else:
             return {}
 
-def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
+def update_node_result_in_store(result: dict[str, Any]) -> tuple[int, int]:
+    """Write one tested node result immediately so UI progress and auto selection can see it."""
+    with lock:
+        current_nodes = read_json(NODES_FILE, [])
+        rid = result.get("id")
+        for n in current_nodes:
+            if n.get("id") == rid:
+                n.update(result)
+                break
+        sorted_nodes = sort_all_nodes(current_nodes)
+        write_json(NODES_FILE, sorted_nodes)
+        available_count = len([n for n in sorted_nodes if n.get("probe_status") == "available"])
+        unavailable_count = len([n for n in sorted_nodes if n.get("probe_status") == "unavailable"])
+    return available_count, unavailable_count
+
+
+def test_multiple_nodes(node_ids: list[str], progress_prefix: str = "正在自动检测节点") -> list[dict[str, Any]]:
     with lock:
         nodes = read_json(NODES_FILE, [])
         requested = set(node_ids)
@@ -1704,7 +1725,7 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
     total = len(to_test)
     worker_count = min(AUTO_TEST_WORKERS, total)
     set_state(
-        last_check_message=f"正在自动检测节点 0/{total}，并发 {worker_count}，请稍候...",
+        last_check_message=f"{progress_prefix} 0/{total}，并发 {worker_count}，请稍候...",
         auto_test_total=total,
         auto_test_done=0,
         auto_test_workers=worker_count,
@@ -1791,6 +1812,8 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
 
     updated_nodes_map = {}
     completed = 0
+    available_count = 0
+    unavailable_count = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
         futures = {executor.submit(test_worker, n): n["id"] for n in to_test}
         for future in concurrent.futures.as_completed(futures):
@@ -1799,7 +1822,7 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
                 res = future.result()
                 updated_nodes_map[nid] = res
             except Exception as e:
-                updated_nodes_map[nid] = {
+                res = {
                     "id": nid,
                     "probe_status": "unavailable",
                     "probe_message": f"Test exception: {e}",
@@ -1814,33 +1837,59 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
                     "blacklist_count": 0,
                     "ip_clean": False,
                 }
+                updated_nodes_map[nid] = res
             completed += 1
-            if completed == total or completed % max(1, min(10, worker_count)) == 0:
-                set_state(
-                    last_check_message=f"正在自动检测节点 {completed}/{total}，已完成 {completed} 个...",
-                    auto_test_total=total,
-                    auto_test_done=completed,
-                    auto_test_workers=worker_count,
-                )
-                
-    with lock:
-        current_nodes = read_json(NODES_FILE, [])
-        for n in current_nodes:
-            nid = n.get("id")
-            if nid in updated_nodes_map:
-                n.update(updated_nodes_map[nid])
-        sorted_nodes = sort_all_nodes(current_nodes)
-        write_json(NODES_FILE, sorted_nodes)
-        available_count = len([n for n in sorted_nodes if n.get("probe_status") == "available"])
-        unavailable_count = len([n for n in sorted_nodes if n.get("probe_status") == "unavailable"])
+            # 逐个节点写入，避免面板长时间显示全部未检/0 进度。
+            available_count, unavailable_count = update_node_result_in_store(res)
+            set_state(
+                last_check_message=f"{progress_prefix} {completed}/{total}，可用 {available_count} 个，不可用 {unavailable_count} 个...",
+                auto_test_total=total,
+                auto_test_done=completed,
+                auto_test_workers=worker_count,
+            )
 
     set_state(
-        last_check_message=f"自动检测完成：共检测 {total} 个，可用 {available_count} 个，不可用 {unavailable_count} 个。",
+        last_check_message=f"{progress_prefix}完成：共检测 {total} 个，可用 {available_count} 个，不可用 {unavailable_count} 个。",
         auto_test_total=total,
         auto_test_done=total,
         auto_test_workers=worker_count,
     )
     return list(updated_nodes_map.values())
+
+
+def run_remaining_tests_background(node_ids: list[str]) -> None:
+    global auto_test_background_running, is_connecting
+    if not node_ids:
+        return
+    with auto_test_background_lock:
+        if auto_test_background_running:
+            return
+        auto_test_background_running = True
+
+    def worker() -> None:
+        global auto_test_background_running, is_connecting
+        try:
+            set_state(
+                last_check_message=f"首批节点检测完成，正在后台继续检测剩余 {len(node_ids)} 个节点...",
+                background_auto_test_total=len(node_ids),
+                background_auto_test_done=0,
+            )
+            test_multiple_nodes(node_ids, progress_prefix="正在后台检测剩余节点")
+            set_state(last_check_message="后台节点检测完成，正在根据 IP 类型和质量重新优选节点...")
+            # 后台检测完成后，如果还没有活动连接则立即故障转移；已有连接则按开关决定是否主动优选。
+            try:
+                is_connecting = False
+                if not active_openvpn_running():
+                    auto_switch_node()
+                elif get_auto_select_best_node():
+                    optimize_active_node_after_tests("background_batch_finished")
+            except Exception as e:
+                set_state(last_check_message=f"后台优选节点失败: {e}")
+        finally:
+            with auto_test_background_lock:
+                auto_test_background_running = False
+
+    threading.Thread(target=worker, daemon=True).start()
 
 def auto_switch_node(attempt: int = 0) -> None:
     if attempt >= 3:
@@ -2079,7 +2128,8 @@ def maintain_valid_nodes(force: bool = False, target_override: list[str] | None 
                         
             write_json(NODES_FILE, merged)
 
-        # 自动检测节点：默认检测本轮拉取/缓存中的全部非活动节点，但限制并发，避免 VPS 过载。
+        # 自动检测节点：首次只同步检测首批节点，剩余节点后台检测。
+        # 这样安装脚本和 Web 面板不会长时间停在 “0/N”，也能尽快建立第一个可用出口。
         with lock:
             current_nodes = read_json(NODES_FILE, [])
             test_candidates = [n for n in current_nodes if not n.get("active")]
@@ -2089,19 +2139,24 @@ def maintain_valid_nodes(force: bool = False, target_override: list[str] | None 
                     to_test = to_test[:AUTO_TEST_MAX_NODES]
             else:
                 to_test = test_candidates[:10]
-            to_test_ids = [n["id"] for n in to_test]
             total_candidates = len(test_candidates)
+            sync_count = min(len(to_test), AUTO_TEST_INITIAL_BATCH if AUTO_TEST_ALL_NODES else len(to_test))
+            sync_test = to_test[:sync_count]
+            rest_test = to_test[sync_count:]
+            sync_test_ids = [n["id"] for n in sync_test]
+            rest_test_ids = [n["id"] for n in rest_test]
+            to_test_ids = sync_test_ids + rest_test_ids
             
-        print(f"[维护线程] 正在自动检测节点: {len(to_test_ids)}/{total_candidates}，并发 {min(AUTO_TEST_WORKERS, max(1, len(to_test_ids)))}", flush=True)
+        print(f"[维护线程] 首批检测节点: {len(sync_test_ids)}/{len(to_test_ids)}，剩余 {len(rest_test_ids)} 个转后台，并发 {min(AUTO_TEST_WORKERS, max(1, len(sync_test_ids)))}", flush=True)
         set_state(
             is_connecting=True,
-            last_check_message=f"正在自动检测节点 0/{len(to_test_ids)}，这可能需要几分钟...",
-            auto_test_total=len(to_test_ids),
+            last_check_message=f"正在检测首批节点 0/{len(sync_test_ids)}，剩余 {len(rest_test_ids)} 个将后台检测...",
+            auto_test_total=len(sync_test_ids),
             auto_test_done=0,
-            auto_test_workers=min(AUTO_TEST_WORKERS, max(1, len(to_test_ids))) if to_test_ids else 0,
+            auto_test_workers=min(AUTO_TEST_WORKERS, max(1, len(sync_test_ids))) if sync_test_ids else 0,
         )
-        if to_test_ids:
-            test_multiple_nodes(to_test_ids)
+        if sync_test_ids:
+            test_multiple_nodes(sync_test_ids, progress_prefix="正在检测首批节点")
         
         is_connecting = False
         
@@ -2113,8 +2168,11 @@ def maintain_valid_nodes(force: bool = False, target_override: list[str] | None 
             if not active_openvpn_running():
                 auto_switch_node()
             elif get_auto_select_best_node():
-                # 检测全部节点后，主动从所有已检测可用节点中按地区/IP类型/风控/延迟选更优节点。
-                optimize_active_node_after_tests("batch_test_finished")
+                # 首批检测后，如果已有明显更优节点，也可以先优化一次。
+                optimize_active_node_after_tests("initial_batch_finished")
+
+        if rest_test_ids:
+            run_remaining_tests_background(rest_test_ids)
 
         valid_nodes_count = len([n for n in merged if n.get("probe_status") == "available"])
         message = f"Fetched {len(candidates)} nodes. Tested {len(to_test_ids)} of {total_candidates} nodes. Auto select: {'on' if get_auto_select_best_node() else 'off'}."
