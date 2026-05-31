@@ -54,9 +54,6 @@ VPNBOOK_ONLY_SAFE_AUTO_TEST_LIMIT = max(1, int(os.environ.get("VPNBOOK_ONLY_SAFE
 # VPNBook 的 .ovpn 配置和服务端推送参数比较激进，单个“检测”也可能改系统路由拖死 SSH。
 # 默认对 VPNBook 使用安全检测：只做 TCP/风控，不启动 OpenVPN 握手；真正连接时再启动 OpenVPN，且会禁止 OpenVPN 写系统路由。
 VPNBOOK_SAFE_TEST_ONLY = os.environ.get("VPNBOOK_SAFE_TEST_ONLY", "1").strip().lower() in {"1", "true", "yes", "on"}
-# VPNBook 安全检测必须非常轻量：默认只做快速 TCP 可达，不跑 OpenVPN，也不做慢速多源风控，避免面板一直卡在“待检测”。
-VPNBOOK_SAFE_TEST_TIMEOUT_SECONDS = float(os.environ.get("VPNBOOK_SAFE_TEST_TIMEOUT_SECONDS", "3"))
-VPNBOOK_SAFE_RISK_ENRICH = os.environ.get("VPNBOOK_SAFE_RISK_ENRICH", "0").strip().lower() in {"1", "true", "yes", "on"}
 VPNBOOK_CONNECT_TIMEOUT_SECONDS = int(os.environ.get("VPNBOOK_CONNECT_TIMEOUT_SECONDS", "25"))
 FETCH_INTERVAL_SECONDS = int(os.environ.get("FETCH_INTERVAL_SECONDS", "960"))
 CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", "960"))
@@ -1946,66 +1943,41 @@ def release_test_index(idx: int) -> None:
     with test_indexes_lock:
         active_test_indexes.discard(idx)
 
-def quick_tcp_latency_ms(host: str, port: int, timeout: float = 3.0) -> tuple[int, str]:
-    start = time.time()
-    try:
-        with socket.create_connection((host, int(port)), timeout=timeout):
-            latency = max(1, int((time.time() - start) * 1000))
-            return latency, ""
-    except Exception as exc:
-        return 0, str(exc)[:120]
-
 def safe_test_vpnbook_node_by_id(node_id: str, node: dict[str, Any]) -> dict[str, Any]:
-    """Safe test for VPNBook nodes.
+    """Safe manual test for VPNBook nodes.
 
-    VPNBook automatic/background tests must never start OpenVPN. To avoid rows staying at
-    “待检测/未检”, this pass only performs a bounded TCP reachability check and optional
-    lightweight IP enrichment. Full OpenVPN is attempted only when the user clicks “切换”.
+    VPNBook tests do not start OpenVPN by default because even a single handshake can run local
+    routing directives from downloaded/template configs on some VPS images. This test verifies the
+    server TCP port and performs IP risk enrichment, then lets manual switching do the real connect.
     """
-    h = str(node.get("remote_host") or node.get("host_name") or node.get("ip") or "").strip()
+    h = str(node.get("remote_host") or node.get("host_name") or node.get("ip") or "")
     p = parse_int(node.get("remote_port")) or 443
-    latency, err = quick_tcp_latency_ms(h, p, VPNBOOK_SAFE_TEST_TIMEOUT_SECONDS)
+    fallback_ping = parse_int(node.get("ping"))
+    latency = vpn_utils.ping_latency_ms(h, p, fallback_ping)
+    risk_ip = resolve_ip_for_risk(h)
     ok = latency > 0
-
-    risk_ip = str(node.get("ip") or "")
-    if not risk_ip or risk_ip == h or not re.match(r"^\d+\.\d+\.\d+\.\d+$", risk_ip):
-        try:
-            old_timeout = socket.getdefaulttimeout()
-            socket.setdefaulttimeout(VPNBOOK_SAFE_TEST_TIMEOUT_SECONDS)
-            risk_ip = socket.gethostbyname(h)
-        except Exception:
-            risk_ip = risk_ip or h
-        finally:
-            try:
-                socket.setdefaulttimeout(old_timeout)
-            except Exception:
-                pass
-
     temp_node = {
         "id": node_id,
         "ip": risk_ip,
         "remote_host": h,
         "remote_port": p,
-        "owner": node.get("owner") or "",
-        "asn": node.get("asn") or "",
-        "as_name": node.get("as_name") or "",
-        "location": node.get("location") or node.get("country") or "",
-        "ip_type": node.get("ip_type") or "unknown",
-        "quality": node.get("quality") or "unknown",
-        "fraud_score": parse_int(node.get("fraud_score")),
-        "clean_score": parse_int(node.get("clean_score")),
-        "risk_level": node.get("risk_level") or "unknown",
-        "fraud_flags": node.get("fraud_flags") or [],
-        "risk_sources": node.get("risk_sources") or ["vpnbook-safe-tcp"],
-        "blacklist_hits": node.get("blacklist_hits") or [],
-        "blacklist_count": parse_int(node.get("blacklist_count")),
-        "ip_clean": bool(node.get("ip_clean")),
+        "owner": "",
+        "asn": "",
+        "as_name": "",
+        "location": "",
+        "ip_type": "",
+        "quality": "",
+        "fraud_score": 0,
+        "clean_score": 0,
+        "risk_level": "unknown",
+        "fraud_flags": [],
+        "risk_sources": [],
+        "blacklist_hits": [],
+        "blacklist_count": 0,
+        "ip_clean": False,
     }
-    if VPNBOOK_SAFE_RISK_ENRICH and re.match(r"^\d+\.\d+\.\d+\.\d+$", str(risk_ip)):
-        try:
-            vpn_utils.enrich_ip_info([temp_node])
-        except Exception as exc:
-            temp_node["risk_sources"] = sorted(set((temp_node.get("risk_sources") or []) + [f"risk-enrich-failed:{str(exc)[:40]}"]))
+    if risk_ip:
+        vpn_utils.enrich_ip_info([temp_node])
 
     with lock:
         nodes = read_json(NODES_FILE, [])
@@ -2015,9 +1987,9 @@ def safe_test_vpnbook_node_by_id(node_id: str, node: dict[str, Any]) -> dict[str
             current["latency_ms"] = latency
             current["probe_status"] = "available" if ok else "unavailable"
             current["probe_message"] = (
-                f"VPNBook 安全检测通过：TCP {h}:{p} 可达，耗时 {latency}ms；已跳过 OpenVPN 握手以避免 VPS 路由/SSH 卡死，点击切换才会真正连接。"
+                "VPNBook 安全检测通过：TCP 端口可达，已跳过 OpenVPN 握手以避免 VPS 路由/SSH 卡死；点击切换才会真正尝试连接。"
                 if ok else
-                f"VPNBook 安全检测失败：TCP {h}:{p} 不可达或超时（{err or 'timeout'}）；未启动 OpenVPN 握手。"
+                "VPNBook 安全检测失败：TCP 端口不可达或超时；未启动 OpenVPN 握手。"
             )
             current["probed_at"] = time.time()
             for key in [
@@ -2710,13 +2682,9 @@ def maintain_valid_nodes(force: bool = False, target_override: list[str] | None 
 
         valid_nodes_count = len([n for n in merged if n.get("probe_status") == "available"])
         message = f"Fetched {len(candidates)} nodes. Tested {len(to_test_ids)} of {total_candidates} nodes. Auto select: {'on' if get_auto_select_best_node() else 'off'}."
-        display_message = (
-            f"节点更新完成，已启动 VPNBook 安全检测 {len(safe_vpnbook_ids)} 个；检测只测 TCP 可达，不会断开当前连接。"
-            if safe_vpnbook_ids else message
-        )
         set_state(
             last_check_at=time.time(),
-            last_check_message=display_message,
+            last_check_message=message,
             active_openvpn_node_id=active_openvpn_node_id,
             valid_nodes=valid_nodes_count,
         )
