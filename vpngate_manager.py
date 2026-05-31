@@ -3502,28 +3502,84 @@ INDEX_HTML = r"""<!doctype html>
       top: 0;
       width: 100%;
       height: 100%;
-      overflow: auto;
+      overflow-y: auto;
+      overflow-x: hidden;
       background-color: rgba(9, 13, 22, 0.7);
       backdrop-filter: blur(8px);
       -webkit-backdrop-filter: blur(8px);
-      align-items: center;
+      align-items: flex-start;
       justify-content: center;
+      padding: 24px 16px;
+      box-sizing: border-box;
+      overscroll-behavior: contain;
     }
     .modal-content {
-      background: rgba(22, 30, 49, 0.9);
+      background: rgba(22, 30, 49, 0.96);
       border: 1px solid var(--border-color);
       border-radius: 20px;
-      width: 90%;
-      max-width: 480px;
-      padding: 32px;
+      width: min(92vw, 560px);
+      max-width: 560px;
+      max-height: calc(100vh - 48px);
+      overflow-y: auto;
+      overflow-x: hidden;
+      padding: 28px;
       box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5);
       position: relative;
       box-sizing: border-box;
       animation: modalFadeIn 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+      scrollbar-width: thin;
+      scrollbar-color: rgba(99, 102, 241, 0.55) rgba(255, 255, 255, 0.06);
+    }
+    .modal-content::-webkit-scrollbar {
+      width: 8px;
+    }
+    .modal-content::-webkit-scrollbar-track {
+      background: rgba(255, 255, 255, 0.04);
+      border-radius: 999px;
+    }
+    .modal-content::-webkit-scrollbar-thumb {
+      background: rgba(99, 102, 241, 0.55);
+      border-radius: 999px;
+    }
+    #settings_form > div:last-child {
+      position: sticky;
+      bottom: -28px;
+      margin-left: -28px;
+      margin-right: -28px;
+      margin-bottom: -28px;
+      padding: 14px 28px 18px;
+      background: linear-gradient(180deg, rgba(22, 30, 49, 0.70) 0%, rgba(22, 30, 49, 0.98) 45%);
+      border-top: 1px solid rgba(255, 255, 255, 0.07);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      z-index: 2;
     }
     @keyframes modalFadeIn {
       from { transform: scale(0.95); opacity: 0; }
       to { transform: scale(1); opacity: 1; }
+    }
+
+    @media (max-width: 640px) {
+      .modal {
+        padding: 12px 10px;
+      }
+      .modal-content {
+        width: 100%;
+        max-height: calc(100vh - 24px);
+        padding: 20px;
+        border-radius: 16px;
+      }
+      #settings_form > div:last-child {
+        bottom: -20px;
+        margin-left: -20px;
+        margin-right: -20px;
+        margin-bottom: -20px;
+        padding: 12px 20px 14px;
+        flex-direction: column-reverse;
+      }
+      #settings_form > div:last-child button {
+        width: 100%;
+      }
     }
     
     /* Inputs in settings */
