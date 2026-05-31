@@ -1,15 +1,16 @@
 # Eianun免费聚合落地IP 🌐
 
-基于 VPNGate / VPNBook / IPSpeed + OpenVPN 的 Linux VPS 出站代理网关。此版本新增多来源节点拉取、指定地区拉取、同地区故障转移、IP 类型优先级、非中断检测与自动兜底。
+基于 VPNGate / VPNBook / IPSpeed + OpenVPN 的 Linux VPS 出站代理网关二改版。此版本已去除原项目广告入口，新增多来源节点拉取、指定地区拉取、同地区故障转移、IP 类型优先级、非中断检测与自动兜底。
 
-## 功能
+## 主要改动
 
-- 名称 **Eianun免费聚合落地IP**。
+- 名称统一改为 **Eianun免费聚合落地IP**。
+- 移除 Web UI 里的 VPS 推广广告和 README 中的推广徽章/链接。
 - 新增多节点来源：默认同时拉取 **VPNGate + VPNBook + IPSpeed**；也可在面板里切换为任意单一或组合来源。
 - VPNBook 来源默认只抓取节点、不参与启动阶段批量 OpenVPN 检测，避免部分 VPS 因 VPNBook 节点握手/路由推送导致 SSH 卡死。
 - 新增后端节点地区过滤：可只保留指定国家/地区节点，不再默认把全部地区节点都写入节点池。
 - Web 管理后台“管理员设置”新增 **节点来源** 和 **拉取地区过滤** 配置。
-- 安装后的主命令改为 `en`，同时保留 `eianun` 兼容别名。
+- 安装后的主命令改为 `en`，同时保留 `eianun` 兼容别名，安装时会删除旧 `ml`。
 - 安装脚本已适配主流 Linux 包管理器：APT、DNF、YUM、Pacman、Zypper、APK、XBPS、Emerge。
 
 ## 支持系统
@@ -31,6 +32,9 @@
 
 ## 快速安装
 
+你的仓库地址是：`https://github.com/illria/gatevpn`
+
+上传文件到该仓库后，使用下面命令安装：
 
 ```bash
 curl -Ls https://raw.githubusercontent.com/illria/gatevpn/main/install.sh -o install.sh
@@ -276,6 +280,12 @@ AUTO_TEST_MAX_NODES=0
 # 自动检测 OpenVPN 握手并发数，默认 8；VPS 配置低建议 3-5
 AUTO_TEST_WORKERS=8
 
+# 刚启动且没有活动连接时，先做一轮质量扫描再连接，避免只测前几个就连到代理/高风险 IP
+INITIAL_QUALITY_SCAN_BEFORE_CONNECT=1
+
+# 首次质量扫描最多同步检测多少个节点；0 表示本轮可检测节点全部扫完再连接
+INITIAL_QUALITY_SCAN_MAX_NODES=80
+
 # 单个节点 OpenVPN 批量检测超时时间，默认 12 秒
 OPENVPN_BATCH_TEST_TIMEOUT_SECONDS=12
 
@@ -283,6 +293,12 @@ OPENVPN_BATCH_TEST_TIMEOUT_SECONDS=12
 AUTO_SELECT_BEST_NODE=1
 # 当前连接正常时不主动断开重连；只更新节点质量，失效时才故障转移
 AUTO_SELECT_ALLOW_ACTIVE_SWITCH=0
+
+# 代理出口连续失败几次才触发故障转移；默认 3，避免瞬时抖动误切走手动选择的住宅 IP
+PROXY_FAIL_AUTO_SWITCH_THRESHOLD=3
+
+# 新连接建立后的健康保护期，默认 75 秒，保护期内不会因为代理检测短暂失败而切换
+PROXY_FAIL_GRACE_SECONDS=75
 
 # 自动优选切换冷却时间，避免频繁跳节点，默认 600 秒
 AUTO_SELECT_COOLDOWN_SECONDS=600

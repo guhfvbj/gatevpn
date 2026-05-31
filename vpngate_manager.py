@@ -99,6 +99,10 @@ AUTO_TEST_WORKERS = max(1, int(os.environ.get("AUTO_TEST_WORKERS", "8")))
 # 剩余节点会转入后台继续检测，并在检测完成后参与自动优选。
 AUTO_TEST_INITIAL_BATCH = max(1, int(os.environ.get("AUTO_TEST_INITIAL_BATCH", "8")))
 OPENVPN_BATCH_TEST_TIMEOUT_SECONDS = int(os.environ.get("OPENVPN_BATCH_TEST_TIMEOUT_SECONDS", "12"))
+# 首次没有活动连接时，先做一轮质量扫描再连接，避免刚安装只测前几个节点就连到代理/高风险 IP。
+# 0 = 不限制，等待本轮全部可完整检测节点；默认 80，兼顾质量和启动速度。
+INITIAL_QUALITY_SCAN_BEFORE_CONNECT = os.environ.get("INITIAL_QUALITY_SCAN_BEFORE_CONNECT", "1").strip().lower() not in {"0", "false", "no", "off"}
+INITIAL_QUALITY_SCAN_MAX_NODES = int(os.environ.get("INITIAL_QUALITY_SCAN_MAX_NODES", "80"))
 
 # 自动优选策略：全部节点检测完成后，主动从已检测可用节点中按地区、IP类型、风控、延迟重新选择更优节点。
 # 这不是只在断线时才切换；如果当前节点明显比候选节点差，也会自动换到更优节点。
@@ -469,9 +473,10 @@ def active_connection_looks_healthy(active_node: dict[str, Any] | None = None) -
     # 刚连接成功后的保护期内，不因代理探测暂时失败而判定当前节点已死。
     if connected_at and now - connected_at < PROXY_FAIL_GRACE_SECONDS:
         return True
-    if int(state.get("proxy_fail_count") or 0) >= PROXY_FAIL_AUTO_SWITCH_THRESHOLD:
-        return False
-    if state.get("proxy_ok") is False:
+    fail_count = int(state.get("proxy_fail_count") or 0)
+    # 单次代理出口探测失败不能代表节点已死。免费 VPN 出口常有短暂抖动，
+    # 只有连续失败达到阈值后才允许故障转移，避免正常住宅/移动节点被误切到代理 IP。
+    if fail_count >= PROXY_FAIL_AUTO_SWITCH_THRESHOLD:
         return False
     if active_node and str(active_node.get("probe_status") or "available").lower() == "unavailable":
         return False
@@ -2356,6 +2361,14 @@ def auto_switch_node(attempt: int = 0) -> None:
         candidates, candidate_reason = choose_auto_failover_candidates(scoped_candidates, all_candidates)
         scope_display = normalize_target_countries_input(failover_targets) if failover_targets else "全部地区"
         ip_type_scope_display = target_ip_types_display(get_target_ip_types())
+
+    # auto_switch_node 只负责“当前出口真的坏了”的保活切换。
+    # 如果当前 OpenVPN 仍在运行且代理失败次数未达到阈值，就保持当前节点，
+    # 防止定时拉取/瞬时探测失败把用户手动选中的住宅 IP 切成代理 IP。
+    if active_openvpn_running() and active_connection_looks_healthy(active_node):
+        msg = f"当前节点仍在健康保护状态，暂不自动切换；固定地区 {scope_display} / IP 类型 {ip_type_scope_display} 的备用节点仅作为候选保留。"
+        set_state(last_check_message=msg)
+        return
         
     if candidates:
         next_node = candidates[0]
@@ -2616,7 +2629,14 @@ def maintain_valid_nodes(force: bool = False, target_override: list[str] | None 
             else:
                 to_test = test_candidates[:10]
             total_candidates = len(raw_test_candidates)
-            sync_count = min(len(to_test), AUTO_TEST_INITIAL_BATCH if AUTO_TEST_ALL_NODES else len(to_test))
+            no_active_for_initial_quality = not active_openvpn_running()
+            if AUTO_TEST_ALL_NODES and INITIAL_QUALITY_SCAN_BEFORE_CONNECT and no_active_for_initial_quality:
+                if INITIAL_QUALITY_SCAN_MAX_NODES <= 0:
+                    sync_count = len(to_test)
+                else:
+                    sync_count = min(len(to_test), max(AUTO_TEST_INITIAL_BATCH, INITIAL_QUALITY_SCAN_MAX_NODES))
+            else:
+                sync_count = min(len(to_test), AUTO_TEST_INITIAL_BATCH if AUTO_TEST_ALL_NODES else len(to_test))
             sync_test = to_test[:sync_count]
             rest_test = to_test[sync_count:]
             sync_test_ids = [n["id"] for n in sync_test]
@@ -2624,10 +2644,11 @@ def maintain_valid_nodes(force: bool = False, target_override: list[str] | None 
             to_test_ids = sync_test_ids + rest_test_ids
 
         vpnbook_skip_note = f"，VPNBook {skipped_vpnbook_auto} 个转安全检测" if skipped_vpnbook_auto else ""
-        print(f"[维护线程] 首批检测节点: {len(sync_test_ids)}/{len(to_test_ids)}，剩余 {len(rest_test_ids)} 个转后台{vpnbook_skip_note}，并发 {min(AUTO_TEST_WORKERS, max(1, len(sync_test_ids)))}", flush=True)
+        initial_scan_note = "；首次连接前质量扫描" if (not active_openvpn_running() and INITIAL_QUALITY_SCAN_BEFORE_CONNECT and sync_test_ids) else ""
+        print(f"[维护线程] 首批检测节点: {len(sync_test_ids)}/{len(to_test_ids)}，剩余 {len(rest_test_ids)} 个转后台{vpnbook_skip_note}{initial_scan_note}，并发 {min(AUTO_TEST_WORKERS, max(1, len(sync_test_ids)))}", flush=True)
         set_state(
             is_connecting=True,
-            last_check_message=f"正在检测首批节点 0/{len(sync_test_ids)}，剩余 {len(rest_test_ids)} 个将后台检测{vpnbook_skip_note}...",
+            last_check_message=f"正在检测首批节点 0/{len(sync_test_ids)}，剩余 {len(rest_test_ids)} 个将后台检测{vpnbook_skip_note}{initial_scan_note}...",
             auto_test_total=len(sync_test_ids),
             auto_test_done=0,
             auto_test_workers=min(AUTO_TEST_WORKERS, max(1, len(sync_test_ids))) if sync_test_ids else 0,
