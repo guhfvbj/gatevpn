@@ -31,9 +31,6 @@
 
 ## 快速安装
 
-你的仓库地址是：`https://github.com/illria/gatevpn`
-
-上传文件到该仓库后，使用下面命令安装：
 
 ```bash
 curl -Ls https://raw.githubusercontent.com/illria/gatevpn/main/install.sh -o install.sh
