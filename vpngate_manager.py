@@ -44,7 +44,12 @@ _vpnbook_template_config_cache = ""
 NODE_SOURCES_ENV = os.environ.get("NODE_SOURCES") or os.environ.get("VPN_NODE_SOURCES") or ""
 # 默认启用 VPNGate + VPNBook；可在面板里调整为 vpngate / vpnbook / vpngate,vpnbook。
 DEFAULT_NODE_SOURCES = os.environ.get("DEFAULT_NODE_SOURCES", "vpngate,vpnbook")
-VPNBOOK_PROTOCOLS = os.environ.get("VPNBOOK_PROTOCOLS", "tcp443,tcp80,udp53,udp25000")
+# VPNBook 的免费节点经常推送较激进的路由/认证参数；默认只抓取 TCP 443，避免一次性生成太多待测节点。
+VPNBOOK_PROTOCOLS = os.environ.get("VPNBOOK_PROTOCOLS", "tcp443")
+# VPNBook 自动检测默认关闭：混合来源时只把 VPNBook 放入节点池，不在启动阶段批量跑 OpenVPN 握手。
+# 这样可以避免部分 VPS 在检测 VPNBook 节点时 SSH 卡死。需要时可以在面板单个检测/手动切换，或显式开启。
+VPNBOOK_AUTO_TEST = os.environ.get("VPNBOOK_AUTO_TEST", "0").strip().lower() in {"1", "true", "yes", "on"}
+VPNBOOK_ONLY_SAFE_AUTO_TEST_LIMIT = max(1, int(os.environ.get("VPNBOOK_ONLY_SAFE_AUTO_TEST_LIMIT", "1")))
 FETCH_INTERVAL_SECONDS = int(os.environ.get("FETCH_INTERVAL_SECONDS", "960"))
 CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", "960"))
 TARGET_VALID_NODES = int(os.environ.get("TARGET_VALID_NODES", "3"))
@@ -916,6 +921,8 @@ def get_state() -> dict[str, Any]:
     state["auto_test_all_nodes"] = AUTO_TEST_ALL_NODES
     state["auto_test_max_nodes"] = AUTO_TEST_MAX_NODES
     state["auto_test_workers"] = AUTO_TEST_WORKERS
+    state["vpnbook_auto_test"] = VPNBOOK_AUTO_TEST
+    state["vpnbook_protocols"] = VPNBOOK_PROTOCOLS
     state["openvpn_batch_test_timeout_seconds"] = OPENVPN_BATCH_TEST_TIMEOUT_SECONDS
     state["auto_select_best_node"] = get_auto_select_best_node()
     state["auto_select_cooldown_seconds"] = AUTO_SELECT_COOLDOWN_SECONDS
@@ -2128,35 +2135,53 @@ def maintain_valid_nodes(force: bool = False, target_override: list[str] | None 
                         
             write_json(NODES_FILE, merged)
 
-        # 自动检测节点：首次只同步检测首批节点，剩余节点后台检测。
-        # 这样安装脚本和 Web 面板不会长时间停在 “0/N”，也能尽快建立第一个可用出口。
+        # 自动检测节点：VPNGate 可批量检测；VPNBook 默认不参与启动/后台批量 OpenVPN 检测。
+        # 原因：部分 VPNBook 节点会在握手/推送路由阶段导致低配 VPS 网络栈或 SSH 卡死。
+        # 混合来源时，VPNBook 只进入节点池供手动单个检测/强制切换；如果用户只选择 VPNBook，则只安全检测 1 个节点。
         with lock:
             current_nodes = read_json(NODES_FILE, [])
-            test_candidates = [n for n in current_nodes if not n.get("active")]
+            raw_test_candidates = [n for n in current_nodes if not n.get("active")]
+            selected_sources = get_node_sources()
+            vpnbook_only = selected_sources == ["vpnbook"]
+            skipped_vpnbook_auto = 0
+            if VPNBOOK_AUTO_TEST:
+                test_candidates = raw_test_candidates
+            elif vpnbook_only:
+                vpnbook_candidates = [n for n in raw_test_candidates if n.get("source") == "vpnbook"]
+                test_candidates = vpnbook_candidates[:VPNBOOK_ONLY_SAFE_AUTO_TEST_LIMIT]
+                skipped_vpnbook_auto = max(0, len(vpnbook_candidates) - len(test_candidates))
+            else:
+                test_candidates = [n for n in raw_test_candidates if n.get("source") != "vpnbook"]
+                skipped_vpnbook_auto = len(raw_test_candidates) - len(test_candidates)
+
             if AUTO_TEST_ALL_NODES:
                 to_test = test_candidates
                 if AUTO_TEST_MAX_NODES > 0:
                     to_test = to_test[:AUTO_TEST_MAX_NODES]
             else:
                 to_test = test_candidates[:10]
-            total_candidates = len(test_candidates)
+            total_candidates = len(raw_test_candidates)
             sync_count = min(len(to_test), AUTO_TEST_INITIAL_BATCH if AUTO_TEST_ALL_NODES else len(to_test))
             sync_test = to_test[:sync_count]
             rest_test = to_test[sync_count:]
             sync_test_ids = [n["id"] for n in sync_test]
             rest_test_ids = [n["id"] for n in rest_test]
             to_test_ids = sync_test_ids + rest_test_ids
-            
-        print(f"[维护线程] 首批检测节点: {len(sync_test_ids)}/{len(to_test_ids)}，剩余 {len(rest_test_ids)} 个转后台，并发 {min(AUTO_TEST_WORKERS, max(1, len(sync_test_ids)))}", flush=True)
+
+        vpnbook_skip_note = f"，已跳过 VPNBook 自动批测 {skipped_vpnbook_auto} 个" if skipped_vpnbook_auto else ""
+        print(f"[维护线程] 首批检测节点: {len(sync_test_ids)}/{len(to_test_ids)}，剩余 {len(rest_test_ids)} 个转后台{vpnbook_skip_note}，并发 {min(AUTO_TEST_WORKERS, max(1, len(sync_test_ids)))}", flush=True)
         set_state(
             is_connecting=True,
-            last_check_message=f"正在检测首批节点 0/{len(sync_test_ids)}，剩余 {len(rest_test_ids)} 个将后台检测...",
+            last_check_message=f"正在检测首批节点 0/{len(sync_test_ids)}，剩余 {len(rest_test_ids)} 个将后台检测{vpnbook_skip_note}...",
             auto_test_total=len(sync_test_ids),
             auto_test_done=0,
             auto_test_workers=min(AUTO_TEST_WORKERS, max(1, len(sync_test_ids))) if sync_test_ids else 0,
+            vpnbook_auto_skipped=skipped_vpnbook_auto,
         )
         if sync_test_ids:
             test_multiple_nodes(sync_test_ids, progress_prefix="正在检测首批节点")
+        elif skipped_vpnbook_auto:
+            set_state(last_check_message=f"VPNBook 节点已加入节点池，但默认不启动批量检测；请在面板单个检测，或设置 VPNBOOK_AUTO_TEST=1 后再启用自动检测。")
         
         is_connecting = False
         

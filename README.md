@@ -7,6 +7,7 @@
 - 名称统一改为 **Eianun免费聚合落地IP**。
 - 移除 Web UI 里的 VPS 推广广告和 README 中的推广徽章/链接。
 - 新增多节点来源：默认同时拉取 **VPNGate + VPNBook**；也可在面板里切换为仅 VPNGate 或仅 VPNBook。
+- VPNBook 来源默认只抓取节点、不参与启动阶段批量 OpenVPN 检测，避免部分 VPS 因 VPNBook 节点握手/路由推送导致 SSH 卡死。
 - 新增后端节点地区过滤：可只保留指定国家/地区节点，不再默认把全部地区节点都写入节点池。
 - Web 管理后台“管理员设置”新增 **节点来源** 和 **拉取地区过滤** 配置。
 - 安装后的主命令改为 `en`，同时保留 `eianun` 兼容别名，安装时会删除旧 `ml`。
@@ -87,7 +88,16 @@ NODE_SOURCES=vpngate,vpnbook
 # 可选：vpngate / vpnbook / vpngate,vpnbook
 ```
 
-VPNBook 当前免费 OpenVPN 页面提供 US、CA、UK、DE、FR 等服务器，并展示通用账号密码；程序会自动抓取页面中的服务器和密码，再下载 `.ovpn` 配置。VPNBook 官网页面显示 OpenVPN 支持 TCP 443、TCP 80、UDP 53、UDP 25000 这些协议选项。若 VPNBook 官网下载端点临时变化导致 `.ovpn` 直链失败，程序会使用公开 OpenVPN 模板替换当前服务器与协议后继续生成候选节点，避免 VPNBook 来源直接归零。
+VPNBook 当前免费 OpenVPN 页面提供 US、CA、UK、DE、FR 等服务器，并展示通用账号密码；程序会自动抓取页面中的服务器和密码，再下载 `.ovpn` 配置。若 VPNBook 官网下载端点临时变化导致 `.ovpn` 直链失败，程序会使用公开 OpenVPN 模板替换当前服务器与协议后继续生成候选节点，避免 VPNBook 来源直接归零。
+
+安全说明：VPNBook 默认只抓取 `tcp443`，并且在 `VPNGate + VPNBook` 混合来源下不会自动批量检测 VPNBook 节点。你可以在面板里对某个 VPNBook 节点单独点“检测/切换”。如果你确认自己的 VPS 扛得住并且想让 VPNBook 也参与自动批量检测，可以在 `/etc/default/eianun-vpngate` 里显式开启：
+
+```bash
+VPNBOOK_AUTO_TEST=1
+VPNBOOK_PROTOCOLS=tcp443
+```
+
+如需更多 VPNBook 协议，可手动改为 `tcp443,tcp80,udp53,udp25000`，但不建议低配 VPS 开启。
 
 ## 指定地区拉取节点
 
@@ -116,6 +126,9 @@ en country
 ```bash
 VPNGATE_TARGET_COUNTRIES=JP,日本
 NODE_SOURCES=vpngate,vpnbook
+# VPNBook 默认不参与批量自动检测，防止低配 VPS 卡死；需要时再手动开启
+VPNBOOK_AUTO_TEST=0
+VPNBOOK_PROTOCOLS=tcp443
 
 # 自动连接/故障转移 IP 类型优先级：默认住宅优先
 # 可选 residential / mobile / normal / hosting / proxy / all
