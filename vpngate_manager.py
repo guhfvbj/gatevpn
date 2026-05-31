@@ -36,6 +36,7 @@ import proxy_server
 
 API_URL = "https://www.vpngate.net/api/iphone/"
 VPNBOOK_OPENVPN_URL = os.environ.get("VPNBOOK_OPENVPN_URL", "https://www.vpnbook.com/freevpn/openvpn")
+IPSPEED_OPENVPN_URL = os.environ.get("IPSPEED_OPENVPN_URL", "https://ipspeed.info/free-openvpn.php")
 VPNBOOK_TEMPLATE_OVPN_URLS = os.environ.get(
     "VPNBOOK_TEMPLATE_OVPN_URLS",
     "https://raw.githubusercontent.com/Sadaqaty/VPNed-Wifi-Access-Point/refs/heads/main/vpnbook-openvpn-us16/vpnbook-us16-tcp443.ovpn"
@@ -43,7 +44,7 @@ VPNBOOK_TEMPLATE_OVPN_URLS = os.environ.get(
 _vpnbook_template_config_cache = ""
 NODE_SOURCES_ENV = os.environ.get("NODE_SOURCES") or os.environ.get("VPN_NODE_SOURCES") or ""
 # 默认启用 VPNGate + VPNBook；可在面板里调整为 vpngate / vpnbook / vpngate,vpnbook。
-DEFAULT_NODE_SOURCES = os.environ.get("DEFAULT_NODE_SOURCES", "vpngate,vpnbook")
+DEFAULT_NODE_SOURCES = os.environ.get("DEFAULT_NODE_SOURCES", "vpngate,vpnbook,ipspeed")
 # VPNBook 的免费节点经常推送较激进的路由/认证参数；默认只抓取 TCP 443，避免一次性生成太多待测节点。
 VPNBOOK_PROTOCOLS = os.environ.get("VPNBOOK_PROTOCOLS", "tcp443")
 # VPNBook 自动检测默认关闭：混合来源时只把 VPNBook 放入节点池，不在启动阶段批量跑 OpenVPN 握手。
@@ -107,6 +108,9 @@ AUTO_SELECT_BEST_NODE = (AUTO_SELECT_BEST_NODE_ENV or "1").strip().lower() not i
 AUTO_SELECT_COOLDOWN_SECONDS = int(os.environ.get("AUTO_SELECT_COOLDOWN_SECONDS", "600"))
 AUTO_SWITCH_MIN_FRAUD_DELTA = int(os.environ.get("AUTO_SWITCH_MIN_FRAUD_DELTA", "20"))
 AUTO_SWITCH_MIN_LATENCY_DELTA_MS = int(os.environ.get("AUTO_SWITCH_MIN_LATENCY_DELTA_MS", "300"))
+# 非中断检测：定时检测只更新节点池和风控信息；当前出口正常时，不因为发现更优节点而主动断开重连。
+# 如果想恢复“检测到更优节点就主动跳转”，可设置 AUTO_SELECT_ALLOW_ACTIVE_SWITCH=1。
+AUTO_SELECT_ALLOW_ACTIVE_SWITCH = os.environ.get("AUTO_SELECT_ALLOW_ACTIVE_SWITCH", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ["VPNGATE_DATA_DIR"]).resolve() if os.environ.get("VPNGATE_DATA_DIR") else ROOT_DIR / "vpngate_data"
@@ -186,7 +190,8 @@ def load_ui_config() -> dict[str, Any]:
             "target_countries": TARGET_COUNTRIES_ENV,
             "target_ip_types": TARGET_IP_TYPES_ENV or "residential",
             "auto_select_best_node": AUTO_SELECT_BEST_NODE,
-            "node_sources": NODE_SOURCES_ENV or DEFAULT_NODE_SOURCES
+            "node_sources": NODE_SOURCES_ENV or DEFAULT_NODE_SOURCES,
+            "auto_select_allow_active_switch": AUTO_SELECT_ALLOW_ACTIVE_SWITCH
         }
         updated = False
         if auth_file.exists():
@@ -194,6 +199,9 @@ def load_ui_config() -> dict[str, Any]:
                 data = json.loads(auth_file.read_text(encoding="utf-8"))
                 for key, val in data.items():
                     config[key] = val
+                if normalize_node_sources_input(config.get("node_sources")) == "vpngate,vpnbook" and not NODE_SOURCES_ENV:
+                    config["node_sources"] = DEFAULT_NODE_SOURCES
+                    updated = True
             except Exception:
                 pass
         if TARGET_COUNTRIES_ENV:
@@ -251,6 +259,7 @@ def split_node_sources(value: Any) -> list[str]:
     aliases = {
         "vpngate": "vpngate", "vpn_gate": "vpngate", "gate": "vpngate", "vg": "vpngate", "筑波": "vpngate",
         "vpnbook": "vpnbook", "book": "vpnbook", "vb": "vpnbook",
+        "ipspeed": "ipspeed", "ip_speed": "ipspeed", "speed": "ipspeed", "is": "ipspeed",
     }
     result: list[str] = []
     seen: set[str] = set()
@@ -260,13 +269,13 @@ def split_node_sources(value: Any) -> list[str]:
             continue
         canonical = aliases.get(token, token)
         if canonical in {"all", "全部", "*"}:
-            canonical = "vpngate,vpnbook"
+            canonical = "vpngate,vpnbook,ipspeed"
         for item in str(canonical).split(","):
             item = item.strip()
-            if item in {"vpngate", "vpnbook"} and item not in seen:
+            if item in {"vpngate", "vpnbook", "ipspeed"} and item not in seen:
                 result.append(item)
                 seen.add(item)
-    return result or ["vpngate", "vpnbook"]
+    return result or ["vpngate", "vpnbook", "ipspeed"]
 
 def normalize_node_sources_input(value: Any) -> str:
     return ",".join(split_node_sources(value))
@@ -276,7 +285,7 @@ def get_node_sources() -> list[str]:
     return split_node_sources(NODE_SOURCES_ENV or cfg.get("node_sources") or DEFAULT_NODE_SOURCES)
 
 def node_sources_display(value: Any) -> str:
-    labels = {"vpngate": "VPNGate", "vpnbook": "VPNBook"}
+    labels = {"vpngate": "VPNGate", "vpnbook": "VPNBook", "ipspeed": "IPSpeed"}
     return " + ".join(labels.get(x, x) for x in split_node_sources(value))
 
 def get_target_countries() -> list[str]:
@@ -361,6 +370,20 @@ def get_auto_select_best_node() -> bool:
         return AUTO_SELECT_BEST_NODE
     cfg = load_ui_config()
     return parse_bool_setting(cfg.get("auto_select_best_node"), AUTO_SELECT_BEST_NODE)
+
+def get_auto_select_allow_active_switch() -> bool:
+    cfg = load_ui_config()
+    return parse_bool_setting(cfg.get("auto_select_allow_active_switch"), AUTO_SELECT_ALLOW_ACTIVE_SWITCH)
+
+def active_connection_looks_healthy(active_node: dict[str, Any] | None = None) -> bool:
+    if not active_openvpn_running():
+        return False
+    state = read_json(STATE_FILE, {})
+    if state.get("proxy_ok") is False:
+        return False
+    if active_node and str(active_node.get("probe_status") or "available").lower() == "unavailable":
+        return False
+    return True
 
 def target_ip_types_display(value: Any) -> str:
     types = split_target_ip_types(value)
@@ -811,6 +834,14 @@ def optimize_active_node_after_tests(reason: str = "") -> str:
         set_state(last_auto_select_message=msg)
         return msg
 
+    if active_connection_looks_healthy(active_node) and not get_auto_select_allow_active_switch():
+        msg = (
+            f"非中断检测：发现更优节点 {best_node.get('id')}，但当前出口正常运行，"
+            "不会为了检测/优选而主动断开重连；仅在当前节点失效时自动故障转移。"
+        )
+        set_state(last_auto_select_message=msg, last_check_message=msg)
+        return msg
+
     state = read_json(STATE_FILE, {})
     now = time.time()
     last_switch = float(state.get("last_auto_select_switch_at") or 0)
@@ -929,6 +960,7 @@ def get_state() -> dict[str, Any]:
     state["vpnbook_protocols"] = VPNBOOK_PROTOCOLS
     state["openvpn_batch_test_timeout_seconds"] = OPENVPN_BATCH_TEST_TIMEOUT_SECONDS
     state["auto_select_best_node"] = get_auto_select_best_node()
+    state["auto_select_allow_active_switch"] = get_auto_select_allow_active_switch()
     state["auto_select_cooldown_seconds"] = AUTO_SELECT_COOLDOWN_SECONDS
     state["auto_switch_min_fraud_delta"] = AUTO_SWITCH_MIN_FRAUD_DELTA
     state["auto_switch_min_latency_delta_ms"] = AUTO_SWITCH_MIN_LATENCY_DELTA_MS
@@ -969,7 +1001,7 @@ def http_get_bytes(url: str, timeout: int = 15, accept: str = "*/*") -> bytes:
         headers={
             "User-Agent": "Mozilla/5.0 eianun-vpngate-manager/2.0",
             "Accept": accept,
-            "Referer": VPNBOOK_OPENVPN_URL if "vpnbook.com" in url else API_URL,
+            "Referer": VPNBOOK_OPENVPN_URL if "vpnbook.com" in url else (IPSPEED_OPENVPN_URL if "ipspeed.info" in url else API_URL),
         },
     )
     with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -1339,6 +1371,179 @@ def fetch_vpnbook_candidates(target_countries: list[str], seen_keys: set[str]) -
     log_to_json("INFO", "VPNBook", f"成功获取 VPNBook 候选节点 {len(candidates)} 个")
     return candidates
 
+
+IPSPEED_COUNTRY_CODES: dict[str, str] = {
+    "canada": "CA", "colombia": "CO", "indonesia": "ID", "japan": "JP", "peru": "PE",
+    "romania": "RO", "russian federation": "RU", "russia": "RU", "south korea": "KR",
+    "korea republic of": "KR", "usa": "US", "united states": "US", "vietnam": "VN",
+    "viet nam": "VN", "thailand": "TH", "united kingdom": "GB", "uk": "GB",
+    "germany": "DE", "france": "FR", "netherlands": "NL", "australia": "AU",
+}
+
+def ipspeed_country_code(country_name: str) -> str:
+    name = re.sub(r"\s+", " ", str(country_name or "").strip())
+    return IPSPEED_COUNTRY_CODES.get(name.lower(), name[:2].upper() if name else "XX")
+
+def parse_ipspeed_rows(page_text: str) -> list[dict[str, Any]]:
+    """Parse IPSpeed free OpenVPN table rows.
+
+    The page exposes downloadable /ovpn/<ip>.ovpn links and text columns:
+    LOCATION, UPTIME, PING. We parse table rows first and fall back to a text regex.
+    """
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add_row(country: str, href: str, ip: str, uptime: Any = 0, ping: Any = 0) -> None:
+        ip = str(ip or "").strip()
+        if not ip or ip in seen:
+            return
+        seen.add(ip)
+        country = re.sub(r"\s+", " ", str(country or "Unknown")).strip() or "Unknown"
+        rows.append({
+            "country_long": country,
+            "country_short": ipspeed_country_code(country),
+            "ip": ip,
+            "url": urllib.parse.urljoin(IPSPEED_OPENVPN_URL, href),
+            "uptime_days": parse_int(uptime),
+            "ping": parse_int(ping),
+        })
+
+    for row_html in re.findall(r"<tr[^>]*>(.*?)</tr>", page_text, flags=re.I | re.S):
+        if ".ovpn" not in row_html.lower():
+            continue
+        link = re.search(r"href=[\"'](?P<href>[^\"']+\.ovpn)[\"'][^>]*>\s*(?P<label>[^<]*?(?P<ip>\d{1,3}(?:\.\d{1,3}){3})\.ovpn)", row_html, flags=re.I | re.S)
+        if not link:
+            continue
+        href = link.group("href")
+        ip = link.group("ip")
+        text = re.sub(r"<[^>]+>", " ", row_html)
+        text = re.sub(r"\s+", " ", text).strip()
+        country = "Unknown"
+        uptime = 0
+        ping = 0
+        m = re.search(r"^\s*\d+\s+(?P<country>.+?)\s+" + re.escape(ip) + r"\.ovpn\s+(?P<uptime>\d+)\s*day\(s\)\s+(?P<ping>\d+|-)\s*ms", text, flags=re.I)
+        if m:
+            country = m.group("country")
+            uptime = m.group("uptime")
+            ping = m.group("ping")
+        else:
+            # Best effort: first text cell after row number and before the ovpn filename.
+            before = text.split(f"{ip}.ovpn", 1)[0]
+            before = re.sub(r"^\s*\d+\s+", "", before).strip()
+            if before:
+                country = before
+            tail = text.split(f"{ip}.ovpn", 1)[-1]
+            m_tail = re.search(r"(?P<uptime>\d+)\s*day\(s\)\s+(?P<ping>\d+|-)\s*ms", tail, flags=re.I)
+            if m_tail:
+                uptime = m_tail.group("uptime")
+                ping = m_tail.group("ping")
+        add_row(country, href, ip, uptime, ping)
+
+    if rows:
+        return rows
+
+    # Fallback for simplified/parsed HTML text.
+    pattern = re.compile(
+        r"(?P<country>[A-Za-z][A-Za-z\s]+?)\s+(?P<ip>\d{1,3}(?:\.\d{1,3}){3})\.ovpn\s+(?P<uptime>\d+)\s*day\(s\)\s*(?P<ping>\d+|-)?\s*ms",
+        re.I,
+    )
+    for m in pattern.finditer(re.sub(r"<[^>]+>", " ", page_text)):
+        ip = m.group("ip")
+        add_row(m.group("country"), f"/ovpn/{ip}.ovpn", ip, m.group("uptime"), m.group("ping"))
+
+    # Last fallback: extract links even if uptime/ping columns are not parseable.
+    if not rows:
+        for href, ip in re.findall(r"href=[\"']([^\"']*?(\d{1,3}(?:\.\d{1,3}){3})\.ovpn)[\"']", page_text, flags=re.I):
+            add_row("Unknown", href, ip, 0, 0)
+    return rows
+
+def ipspeed_row_to_node(row: dict[str, Any], config_text: str) -> dict[str, Any]:
+    ip = str(row.get("ip") or "")
+    country_long = str(row.get("country_long") or "Unknown")
+    country_short = str(row.get("country_short") or ipspeed_country_code(country_long) or "XX")
+    country_zh = vpn_utils.COUNTRY_TRANSLATIONS.get(country_long, country_long)
+    text = sanitize_openvpn_config_for_eianun(config_text)
+    remote_host, remote_port, proto = vpn_utils.parse_remote(text, ip)
+    if not remote_host:
+        remote_host = ip
+    if not remote_port:
+        remote_port = 443
+    node_id = safe_name("_".join(["IPSPEED", country_short, ip or remote_host, str(remote_port), proto or "ovpn"]))
+    config_path = CONFIG_DIR / f"{node_id}.ovpn"
+    return {
+        "id": node_id,
+        "source": "ipspeed",
+        "country": country_zh,
+        "country_short": country_short,
+        "host_name": ip,
+        "auth_user": OPENVPN_AUTH_USER,
+        "auth_pass": OPENVPN_AUTH_PASS,
+        "ip": ip,
+        "score": parse_int(row.get("uptime_days")),
+        "ping": parse_int(row.get("ping")),
+        "speed": 0,
+        "sessions": 0,
+        "owner": "",
+        "asn": "",
+        "as_name": "",
+        "location": "",
+        "ip_type": "",
+        "quality": "",
+        "fraud_score": 0,
+        "clean_score": 0,
+        "risk_level": "unknown",
+        "fraud_flags": [],
+        "risk_sources": [],
+        "blacklist_hits": [],
+        "blacklist_count": 0,
+        "ip_clean": False,
+        "latency_ms": 0,
+        "config_file": str(config_path),
+        "config_text": text,
+        "proto": proto,
+        "remote_host": remote_host,
+        "remote_port": remote_port,
+        "fetched_at": time.time(),
+        "probe_status": "not_checked",
+        "probe_message": "IPSpeed source; OpenVPN config fetched from ipspeed.info",
+        "probed_at": 0,
+    }
+
+def fetch_ipspeed_candidates(target_countries: list[str], seen_keys: set[str]) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    target_display = normalize_target_countries_input(target_countries) or "全部地区"
+    try:
+        page_text = http_get_bytes(IPSPEED_OPENVPN_URL, timeout=18, accept="text/html,*/*").decode("utf-8", errors="replace")
+        rows = parse_ipspeed_rows(page_text)
+        matched = 0
+        filtered = 0
+        for row in rows:
+            country_row = {"CountryShort": row.get("country_short", ""), "CountryLong": row.get("country_long", "")}
+            if not row_matches_target_countries(country_row, target_countries):
+                filtered += 1
+                continue
+            matched += 1
+            if matched > MAX_SCAN_ROWS:
+                break
+            ip = str(row.get("ip") or "")
+            key = f"ipspeed:{ip}"
+            if not ip or key in seen_keys or ip in seen_keys:
+                continue
+            try:
+                text = http_get_bytes(str(row.get("url")), timeout=18, accept="application/x-openvpn-profile,text/plain,*/*").decode("utf-8", errors="replace")
+                if not looks_like_openvpn_config(text):
+                    log_to_json("WARNING", "IPSpeed", f"下载到的配置不像 OpenVPN 文件: {row.get('url')}")
+                    continue
+                node = ipspeed_row_to_node(row, text)
+                candidates.append(node)
+                seen_keys.add(key)
+            except Exception as exc:
+                log_to_json("WARNING", "IPSpeed", f"下载 OpenVPN 配置失败 {ip}: {exc}")
+        log_to_json("INFO", "IPSpeed", f"IPSpeed 地区过滤 {target_display}: 匹配 {matched} 行，跳过 {filtered} 行，成功 {len(candidates)} 个")
+    except Exception as exc:
+        log_to_json("ERROR", "IPSpeed", f"IPSpeed 节点拉取失败: {exc}")
+    return candidates
+
 def fetch_candidates(target_override: list[str] | None = None) -> list[dict[str, Any]]:
     blacklist = load_blacklist()
     candidates: list[dict[str, Any]] = []
@@ -1354,6 +1559,8 @@ def fetch_candidates(target_override: list[str] | None = None) -> list[dict[str,
                 candidates.extend(fetch_vpngate_candidates(target_countries, seen_keys))
             elif source == "vpnbook":
                 candidates.extend(fetch_vpnbook_candidates(target_countries, seen_keys))
+            elif source == "ipspeed":
+                candidates.extend(fetch_ipspeed_candidates(target_countries, seen_keys))
         except Exception as exc:
             log_to_json("ERROR", "Main", f"节点来源 {source} 拉取失败: {exc}")
         source_counts[source] = len(candidates) - before
@@ -1997,7 +2204,7 @@ def run_remaining_tests_background(node_ids: list[str]) -> None:
                 background_auto_test_done=0,
             )
             test_multiple_nodes(node_ids, progress_prefix="正在后台检测剩余节点")
-            set_state(last_check_message="后台节点检测完成，正在根据 IP 类型和质量重新优选节点...")
+            set_state(last_check_message="后台节点检测完成，已更新节点质量；当前连接正常时不会主动断开重连。")
             # 后台检测完成后，如果还没有活动连接则立即故障转移；已有连接则按开关决定是否主动优选。
             try:
                 is_connecting = False
@@ -3624,11 +3831,14 @@ INDEX_HTML = r"""<!doctype html>
           <div class="form-group" style="margin-bottom: 12px;">
             <label class="form-label" for="settings_node_sources">节点来源</label>
             <select id="settings_node_sources" class="input-field">
-              <option value="vpngate,vpnbook">VPNGate + VPNBook（推荐）</option>
+              <option value="vpngate,vpnbook,ipspeed">VPNGate + VPNBook + IPSpeed（推荐）</option>
+              <option value="vpngate,ipspeed">VPNGate + IPSpeed</option>
+              <option value="vpngate,vpnbook">VPNGate + VPNBook</option>
               <option value="vpngate">仅 VPNGate</option>
               <option value="vpnbook">仅 VPNBook</option>
+              <option value="ipspeed">仅 IPSpeed</option>
             </select>
-            <div style="font-size: 12px; color: var(--text-secondary); margin-top: 6px; line-height: 1.4;">VPNBook 当前页面列出 US/CA/UK/DE/FR 等 OpenVPN 服务器，密码会自动从官网页面读取；如果官网改版导致配置下载失败，会自动跳过该来源。</div>
+            <div style="font-size: 12px; color: var(--text-secondary); margin-top: 6px; line-height: 1.4;">IPSpeed 会从 ipspeed.info 的 OpenVPN 列表读取 .ovpn 文件；VPNBook 密码会自动从官网读取。定时刷新只更新节点池，当前出口正常时不主动断线。</div>
           </div>
 
           <div class="form-group" style="margin-bottom: 12px;">
@@ -3649,6 +3859,15 @@ INDEX_HTML = r"""<!doctype html>
               <option value="0">关闭：只在断线/失效时故障转移</option>
             </select>
             <div style="font-size: 12px; color: var(--text-secondary); margin-top: 6px; line-height: 1.4;">对应 AUTO_SELECT_BEST_NODE。关闭后不会因为检测到住宅/移动等更优节点而主动跳转，但节点失效时仍会自动故障转移。</div>
+          </div>
+
+          <div class="form-group" style="margin-bottom: 12px;">
+            <label class="form-label" for="settings_auto_select_allow_active_switch">当前连接正常时是否主动切换更优节点</label>
+            <select id="settings_auto_select_allow_active_switch" class="input-field">
+              <option value="0">不主动切换：检测不中断当前出口（推荐）</option>
+              <option value="1">允许主动切换：发现明显更优节点时会短暂断线</option>
+            </select>
+            <div style="font-size: 12px; color: var(--text-secondary); margin-top: 6px; line-height: 1.4;">对应 AUTO_SELECT_ALLOW_ACTIVE_SWITCH。推荐关闭：16 分钟定时检测只更新节点质量，不会因为优选而断开正在使用的代理。</div>
           </div>
 
           <div class="form-group" style="margin-bottom: 12px;">
@@ -3978,7 +4197,7 @@ function render(){
   const targetInfo = state.target_countries_display || state.target_countries || "全部地区";
   const ipTypeInfo = state.target_ip_types_display || "住宅IP";
   const failoverInfo = state.failover_country_display || targetInfo || "未固定";
-  const sourceInfo = state.node_sources_display || state.node_sources || "VPNGate + VPNBook";
+  const sourceInfo = state.node_sources_display || state.node_sources || "VPNGate + VPNBook + IPSpeed";
   $("status").innerHTML=`<span class="status-dot"></span>HTTP 代理本地接口：http://127.0.0.1:7928 | 来源：${esc(sourceInfo)} | 拉取地区：${esc(targetInfo)} | 自动IP优先级：${esc(ipTypeInfo)} | 故障转移地区：${esc(failoverInfo)} | 活动节点：${activeNodeInfo} | 状态：${statusMessage}`;
   
   // Update proxy test status card based on background checks
@@ -4482,7 +4701,8 @@ function openSettingsModal() {
     $("settings_port").value = state.port || 8787;
     $("settings_suffix").value = state.secret_path || "EJsW2EeBo9lY";
     $("settings_target_countries").value = state.target_countries || "";
-    $("settings_node_sources").value = state.node_sources || "vpngate,vpnbook";
+    $("settings_node_sources").value = state.node_sources || "vpngate,vpnbook,ipspeed";
+    $("settings_auto_select_allow_active_switch").value = state.auto_select_allow_active_switch ? "1" : "0";
     const ipTypeValue = state.target_ip_types || "residential";
     const legacyIpTypeMap = {
       "residential,mobile": "residential",
@@ -4515,6 +4735,7 @@ async function saveSettings(e) {
   const nodeSources = $("settings_node_sources").value.trim();
   const targetIpTypes = $("settings_target_ip_types").value.trim();
   const autoSelectBestNode = $("settings_auto_select_best_node").value === "1";
+  const autoSelectAllowActiveSwitch = $("settings_auto_select_allow_active_switch").value === "1";
   const newUsername = $("settings_new_username").value.trim();
   const newPassword = $("settings_new_password").value.trim();
   const currUsername = $("settings_curr_username").value.trim();
@@ -4546,6 +4767,7 @@ async function saveSettings(e) {
         node_sources: nodeSources,
         target_ip_types: targetIpTypes,
         auto_select_best_node: autoSelectBestNode,
+        auto_select_allow_active_switch: autoSelectAllowActiveSwitch,
         new_username: newUsername,
         new_password: newPassword,
         curr_username: currUsername,
@@ -4966,6 +5188,7 @@ class Handler(BaseHTTPRequestHandler):
                 new_node_sources = normalize_node_sources_input(payload.get("node_sources") or NODE_SOURCES_ENV or DEFAULT_NODE_SOURCES)
                 new_target_ip_types = normalize_target_ip_types_input(payload.get("target_ip_types") or TARGET_IP_TYPES_ENV or "residential")
                 new_auto_select_best_node = parse_bool_setting(payload.get("auto_select_best_node"), True)
+                new_auto_select_allow_active_switch = parse_bool_setting(payload.get("auto_select_allow_active_switch"), False)
                 new_username = str(payload.get("new_username") or "").strip()
                 new_password = str(payload.get("new_password") or "").strip()
                 
@@ -4999,6 +5222,7 @@ class Handler(BaseHTTPRequestHandler):
                 ui_cfg["node_sources"] = new_node_sources
                 ui_cfg["target_ip_types"] = new_target_ip_types
                 ui_cfg["auto_select_best_node"] = new_auto_select_best_node
+                ui_cfg["auto_select_allow_active_switch"] = new_auto_select_allow_active_switch
                 if new_username:
                     ui_cfg["username"] = new_username
                 if new_password:
