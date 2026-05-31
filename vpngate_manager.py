@@ -50,6 +50,10 @@ VPNBOOK_PROTOCOLS = os.environ.get("VPNBOOK_PROTOCOLS", "tcp443")
 # 这样可以避免部分 VPS 在检测 VPNBook 节点时 SSH 卡死。需要时可以在面板单个检测/手动切换，或显式开启。
 VPNBOOK_AUTO_TEST = os.environ.get("VPNBOOK_AUTO_TEST", "0").strip().lower() in {"1", "true", "yes", "on"}
 VPNBOOK_ONLY_SAFE_AUTO_TEST_LIMIT = max(1, int(os.environ.get("VPNBOOK_ONLY_SAFE_AUTO_TEST_LIMIT", "1")))
+# VPNBook 的 .ovpn 配置和服务端推送参数比较激进，单个“检测”也可能改系统路由拖死 SSH。
+# 默认对 VPNBook 使用安全检测：只做 TCP/风控，不启动 OpenVPN 握手；真正连接时再启动 OpenVPN，且会禁止 OpenVPN 写系统路由。
+VPNBOOK_SAFE_TEST_ONLY = os.environ.get("VPNBOOK_SAFE_TEST_ONLY", "1").strip().lower() in {"1", "true", "yes", "on"}
+VPNBOOK_CONNECT_TIMEOUT_SECONDS = int(os.environ.get("VPNBOOK_CONNECT_TIMEOUT_SECONDS", "25"))
 FETCH_INTERVAL_SECONDS = int(os.environ.get("FETCH_INTERVAL_SECONDS", "960"))
 CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", "960"))
 TARGET_VALID_NODES = int(os.environ.get("TARGET_VALID_NODES", "3"))
@@ -1143,8 +1147,43 @@ def looks_like_openvpn_config(text: str) -> bool:
     lower = (text or "").lower()
     return "client" in lower[:800] and "remote" in lower and ("<ca>" in lower or "-----begin certificate-----" in lower)
 
+def sanitize_openvpn_config_for_eianun(config_text: str) -> str:
+    """Remove local OpenVPN directives that can hijack the VPS default route or run scripts.
+
+    Eianun uses --route-nopull/--route-noexec plus policy routing. Free templates, especially
+    VPNBook templates copied from the web, often contain redirect-gateway, route or script hooks.
+    Leaving those directives in the file can make a manual test or connect rewrite the host routing
+    table and freeze SSH.
+    """
+    dangerous_prefixes = (
+        "redirect-gateway",
+        "route",
+        "route-ipv6",
+        "dhcp-option",
+        "pull-filter",
+        "up",
+        "down",
+        "route-up",
+        "iproute",
+        "script-security",
+        "block-outside-dns",
+    )
+    kept: list[str] = []
+    for raw in config_text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        stripped = raw.strip()
+        lower = stripped.lower()
+        if not stripped or stripped.startswith(("#", ";")):
+            kept.append(raw)
+            continue
+        key = lower.split(None, 1)[0]
+        if key in dangerous_prefixes:
+            kept.append(f"# eianun removed unsafe directive: {stripped}")
+            continue
+        kept.append(raw)
+    return "\n".join(kept).strip() + "\n"
+
 def normalize_vpnbook_config_text(config_text: str, host: str, proto: str, port: int) -> str:
-    text = config_text.replace("\r\n", "\n").replace("\r", "\n").strip() + "\n"
+    text = sanitize_openvpn_config_for_eianun(config_text).replace("\r\n", "\n").replace("\r", "\n").strip() + "\n"
     text = re.sub(r"(?m)^proto\s+\S+", f"proto {proto}", text)
     if re.search(r"(?m)^remote\s+\S+\s+\d+(?:\s+\S+)?", text):
         text = re.sub(r"(?m)^remote\s+\S+\s+\d+(?:\s+\S+)?", f"remote {host} {port}", text, count=1)
@@ -1216,7 +1255,7 @@ def vpnbook_row_to_node(server: dict[str, str], proto_name: str, config_text: st
     country_long = server.get("country_long") or country_short
     country_zh = vpn_utils.COUNTRY_TRANSLATIONS.get(country_long, country_long)
     # 确保 config 内写入当前选择的 remote/proto，并让 OpenVPN 使用统一认证文件。
-    text = config_text
+    text = sanitize_openvpn_config_for_eianun(config_text)
     text = re.sub(r"(?m)^proto\s+\S+", f"proto {proto}", text)
     text = re.sub(r"(?m)^remote\s+\S+\s+\d+(?:\s+\S+)?", f"remote {host} {port}", text)
     if re.search(r"(?m)^auth-user-pass(?:\s+.+)?$", text):
@@ -1383,6 +1422,15 @@ def openvpn_command(config_file: str, route_nopull: bool, dev: str = "tun0", aut
             "--pull-filter",
             "ignore",
             "ifconfig-ipv6",
+            "--pull-filter",
+            "ignore",
+            "redirect-gateway",
+            "--pull-filter",
+            "ignore",
+            "route",
+            "--pull-filter",
+            "ignore",
+            "dhcp-option",
             "--route-delay",
             "2",
             "--connect-retry-max",
@@ -1415,7 +1463,10 @@ def openvpn_command(config_file: str, route_nopull: bool, dev: str = "tun0", aut
         pass
         
     if route_nopull:
-        command.append("--route-nopull")
+        # route-nopull 只阻止服务端 push 的路由；部分 VPNBook 配置文件自身包含
+        # redirect-gateway/route，仍可能改默认路由导致 SSH 断连。route-noexec 会让
+        # OpenVPN 不执行任何路由添加，后续统一由本程序的策略路由接管。
+        command.extend(["--route-nopull", "--route-noexec"])
     return command
 
 def stop_process(process: subprocess.Popen[str] | None) -> None:
@@ -1622,6 +1673,66 @@ def release_test_index(idx: int) -> None:
     with test_indexes_lock:
         active_test_indexes.discard(idx)
 
+def safe_test_vpnbook_node_by_id(node_id: str, node: dict[str, Any]) -> dict[str, Any]:
+    """Safe manual test for VPNBook nodes.
+
+    VPNBook tests do not start OpenVPN by default because even a single handshake can run local
+    routing directives from downloaded/template configs on some VPS images. This test verifies the
+    server TCP port and performs IP risk enrichment, then lets manual switching do the real connect.
+    """
+    h = str(node.get("remote_host") or node.get("host_name") or node.get("ip") or "")
+    p = parse_int(node.get("remote_port")) or 443
+    fallback_ping = parse_int(node.get("ping"))
+    latency = vpn_utils.ping_latency_ms(h, p, fallback_ping)
+    risk_ip = resolve_ip_for_risk(h)
+    ok = latency > 0
+    temp_node = {
+        "id": node_id,
+        "ip": risk_ip,
+        "remote_host": h,
+        "remote_port": p,
+        "owner": "",
+        "asn": "",
+        "as_name": "",
+        "location": "",
+        "ip_type": "",
+        "quality": "",
+        "fraud_score": 0,
+        "clean_score": 0,
+        "risk_level": "unknown",
+        "fraud_flags": [],
+        "risk_sources": [],
+        "blacklist_hits": [],
+        "blacklist_count": 0,
+        "ip_clean": False,
+    }
+    if risk_ip:
+        vpn_utils.enrich_ip_info([temp_node])
+
+    with lock:
+        nodes = read_json(NODES_FILE, [])
+        current = next((item for item in nodes if item.get("id") == node_id), None)
+        if current:
+            current["ip"] = risk_ip or current.get("ip") or h
+            current["latency_ms"] = latency
+            current["probe_status"] = "available" if ok else "unavailable"
+            current["probe_message"] = (
+                "VPNBook 安全检测通过：TCP 端口可达，已跳过 OpenVPN 握手以避免 VPS 路由/SSH 卡死；点击切换才会真正尝试连接。"
+                if ok else
+                "VPNBook 安全检测失败：TCP 端口不可达或超时；未启动 OpenVPN 握手。"
+            )
+            current["probed_at"] = time.time()
+            for key in [
+                "owner", "asn", "as_name", "location", "ip_type", "quality", "fraud_score",
+                "clean_score", "risk_level", "fraud_flags", "risk_sources", "blacklist_hits",
+                "blacklist_count", "ip_clean",
+            ]:
+                current[key] = temp_node.get(key, current.get(key))
+            sorted_nodes = sort_all_nodes(nodes)
+            write_json(NODES_FILE, sorted_nodes)
+            return next((item for item in sorted_nodes if item.get("id") == node_id), current)
+    return {}
+
 def test_node_by_id(node_id: str) -> dict[str, Any]:
     with lock:
         nodes = read_json(NODES_FILE, [])
@@ -1633,11 +1744,15 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
         h = str(node.get("remote_host") or node.get("ip"))
         p = parse_int(node.get("remote_port"))
         fallback_ping = parse_int(node.get("ping"))
+        node_source = str(node.get("source") or "").lower()
+
+    if node_source == "vpnbook" and VPNBOOK_SAFE_TEST_ONLY:
+        return safe_test_vpnbook_node_by_id(node_id, node)
 
     temp_path = Path(config_file)
     try:
         CONFIG_DIR.mkdir(exist_ok=True, parents=True)
-        temp_path.write_text(config_text, encoding="utf-8")
+        temp_path.write_text(sanitize_openvpn_config_for_eianun(config_text), encoding="utf-8")
     except Exception as e:
         raise RuntimeError(f"Failed to write temp config file: {e}")
 
@@ -1995,12 +2110,13 @@ def connect_node(node_id: str, update_failover_scope: bool = True, allow_manual_
         config_path = Path(node["config_file"])
         try:
             CONFIG_DIR.mkdir(exist_ok=True, parents=True)
-            config_path.write_text(node.get("config_text") or "", encoding="utf-8")
+            config_path.write_text(sanitize_openvpn_config_for_eianun(node.get("config_text") or ""), encoding="utf-8")
         except Exception as e:
             raise RuntimeError(f"Failed to write configuration: {e}")
 
         set_state(active_node_latency="启动核心", last_check_message="正在启动 OpenVPN Core 核心服务并建立连接...")
-        ok, message, process = run_openvpn_until_ready(str(node["config_file"]), keep_alive=True, route_nopull=True, auth_file=auth_file_for_node(node))
+        connect_timeout = VPNBOOK_CONNECT_TIMEOUT_SECONDS if str(node.get("source") or "").lower() == "vpnbook" else None
+        ok, message, process = run_openvpn_until_ready(str(node["config_file"]), keep_alive=True, route_nopull=True, timeout=connect_timeout, auth_file=auth_file_for_node(node))
         if not ok or process is None:
             try:
                 if config_path.exists():

@@ -328,3 +328,15 @@ STRICT_IP_TYPE_FILTER=1
 
 为了避免频繁跳节点，自动优选有冷却时间：默认 10 分钟。你可以在 Web 面板设置里关闭「检测完成后自动优选节点」，也可以通过 `AUTO_SELECT_COOLDOWN_SECONDS` 调整冷却时间，或者设置 `AUTO_SELECT_BEST_NODE=0` 关闭主动择优，只保留断线故障转移。
 
+
+### VPNBook 节点检测安全说明
+
+VPNBook 来源默认采用安全检测模式：面板点击“检测”时只检查 TCP 端口连通性和 IP 风险信息，不直接启动 OpenVPN 握手，避免部分 VPNBook 配置在测试阶段改写系统路由导致 SSH 卡死。点击“切换”时才会真正启动 OpenVPN，并且程序会使用 `route-nopull + route-noexec` 和配置清洗来避免默认路由被劫持。
+
+如确需让 VPNBook 检测也执行完整 OpenVPN 握手，可在 `/etc/default/eianun-vpngate` 设置：
+
+```bash
+VPNBOOK_SAFE_TEST_ONLY=0
+```
+
+低配 VPS 不建议关闭该安全模式。
