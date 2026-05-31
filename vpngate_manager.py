@@ -111,6 +111,11 @@ AUTO_SWITCH_MIN_LATENCY_DELTA_MS = int(os.environ.get("AUTO_SWITCH_MIN_LATENCY_D
 # 非中断检测：定时检测只更新节点池和风控信息；当前出口正常时，不因为发现更优节点而主动断开重连。
 # 如果想恢复“检测到更优节点就主动跳转”，可设置 AUTO_SELECT_ALLOW_ACTIVE_SWITCH=1。
 AUTO_SELECT_ALLOW_ACTIVE_SWITCH = os.environ.get("AUTO_SELECT_ALLOW_ACTIVE_SWITCH", "0").strip().lower() in {"1", "true", "yes", "on"}
+# 代理健康检查保护：OpenVPN 刚建立后，tun0/策略路由/本地代理有短暂稳定期。
+# 在保护期内或连续失败次数未达到阈值时，不会把当前节点判死并强制断开，避免“已连接 -> 立即清理 -> 反复重连”。
+PROXY_FAIL_GRACE_SECONDS = int(os.environ.get("PROXY_FAIL_GRACE_SECONDS", "75"))
+PROXY_FAIL_AUTO_SWITCH_THRESHOLD = max(1, int(os.environ.get("PROXY_FAIL_AUTO_SWITCH_THRESHOLD", "3")))
+AUTO_SWITCH_RETRY_COOLDOWN_SECONDS = max(10, int(os.environ.get("AUTO_SWITCH_RETRY_COOLDOWN_SECONDS", "45")))
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ["VPNGATE_DATA_DIR"]).resolve() if os.environ.get("VPNGATE_DATA_DIR") else ROOT_DIR / "vpngate_data"
@@ -459,6 +464,13 @@ def active_connection_looks_healthy(active_node: dict[str, Any] | None = None) -
     if not active_openvpn_running():
         return False
     state = read_json(STATE_FILE, {})
+    now = time.time()
+    connected_at = float(state.get("active_connected_at") or 0)
+    # 刚连接成功后的保护期内，不因代理探测暂时失败而判定当前节点已死。
+    if connected_at and now - connected_at < PROXY_FAIL_GRACE_SECONDS:
+        return True
+    if int(state.get("proxy_fail_count") or 0) >= PROXY_FAIL_AUTO_SWITCH_THRESHOLD:
+        return False
     if state.get("proxy_ok") is False:
         return False
     if active_node and str(active_node.get("probe_status") or "available").lower() == "unavailable":
@@ -1008,6 +1020,12 @@ def get_state() -> dict[str, Any]:
     state.setdefault("auto_test_done", 0)
     state.setdefault("last_auto_select_switch_at", 0)
     state.setdefault("last_auto_select_message", "")
+    state.setdefault("active_connected_at", 0)
+    state.setdefault("proxy_fail_count", 0)
+    state.setdefault("last_auto_switch_attempt_at", 0)
+    state["proxy_fail_grace_seconds"] = PROXY_FAIL_GRACE_SECONDS
+    state["proxy_fail_auto_switch_threshold"] = PROXY_FAIL_AUTO_SWITCH_THRESHOLD
+    state["auto_switch_retry_cooldown_seconds"] = AUTO_SWITCH_RETRY_COOLDOWN_SECONDS
     
     return state
 
@@ -2265,6 +2283,17 @@ def auto_switch_node(attempt: int = 0) -> None:
         print("[自动切换] 连续切换失败已达 3 次，停止切换以防止主线程死锁，将在后台重新加载节点...", flush=True)
         set_state(last_check_message="自动切换连续失败，将等待下一轮节点维护")
         return
+    if is_connecting:
+        set_state(last_check_message="当前正在建立连接，暂不触发新的自动切换")
+        return
+    state = read_json(STATE_FILE, {})
+    now = time.time()
+    last_attempt = float(state.get("last_auto_switch_attempt_at") or 0)
+    if active_openvpn_running() and last_attempt and now - last_attempt < AUTO_SWITCH_RETRY_COOLDOWN_SECONDS:
+        left = int(AUTO_SWITCH_RETRY_COOLDOWN_SECONDS - (now - last_attempt))
+        set_state(last_check_message=f"自动切换冷却中，当前连接暂保留，约 {left} 秒后再评估")
+        return
+    set_state(last_auto_switch_attempt_at=now)
         
     with lock:
         nodes = read_json(NODES_FILE, [])
@@ -2295,19 +2324,29 @@ def auto_switch_node(attempt: int = 0) -> None:
             log_to_json("WARNING", "VPN", err_msg)
             auto_switch_node(attempt + 1)
     else:
-        if failover_targets:
-            msg = f"固定地区 {scope_display} / IP 类型 {ip_type_scope_display} 当前没有可用备用节点，将清理当前连接并后台拉取同地区新节点..."
+        # 没有备用节点时不要直接清理当前连接。免费节点池波动大，
+        # 直接 stop 会造成“连接成功 -> 没备用 -> 立即断开 -> 反复重连”。
+        if active_openvpn_running() and active_node:
+            if failover_targets:
+                msg = f"固定地区 {scope_display} / IP 类型 {ip_type_scope_display} 当前没有可用备用节点，已保留当前连接，后台继续拉取同地区新节点..."
+            else:
+                msg = "当前没有可用备用节点，已保留当前连接，后台继续补充节点池..."
+            print(f"[自动切换] {msg}", flush=True)
+            log_to_json("WARNING", "VPN", msg)
+            set_state(last_check_message=msg)
         else:
-            msg = "没有可用的备选节点，将自动断开并清理当前连接状态，同时在后台异步获取新节点..."
-        print(f"[自动切换] {msg}", flush=True)
-        log_to_json("WARNING", "VPN", msg)
-        stop_active_openvpn()
-        with lock:
-            nodes = read_json(NODES_FILE, [])
-            for item in nodes:
-                item["active"] = False
-            write_json(NODES_FILE, nodes)
-        set_state(active_openvpn_node_id="", last_check_message=msg)
+            if failover_targets:
+                msg = f"固定地区 {scope_display} / IP 类型 {ip_type_scope_display} 当前没有可用备用节点，后台拉取同地区新节点..."
+            else:
+                msg = "没有可用的备选节点，将在后台异步获取新节点..."
+            print(f"[自动切换] {msg}", flush=True)
+            log_to_json("WARNING", "VPN", msg)
+            with lock:
+                nodes = read_json(NODES_FILE, [])
+                for item in nodes:
+                    item["active"] = False
+                write_json(NODES_FILE, nodes)
+            set_state(active_openvpn_node_id="", last_check_message=msg)
         
         def bg_fetch_and_switch():
             try:
@@ -2388,6 +2427,7 @@ def connect_node(node_id: str, update_failover_scope: bool = True, allow_manual_
         
         set_state(active_node_latency="配置路由", last_check_message="正在配置策略路由规则与流量转发...")
         setup_policy_routing("tun0")
+        set_state(active_connected_at=time.time(), proxy_fail_count=0, proxy_error="", last_auto_switch_attempt_at=0)
         
         global last_active_ping_time, last_active_latency
         last_active_ping_time = time.time()
@@ -2646,7 +2686,7 @@ LOGIN_HTML = r"""<!DOCTYPE html>
       border: 1px solid var(--border-color);
       border-radius: 20px;
       padding: 40px 32px;
-      box-shadow: 0 20px 40px rgba(0, 0, 0, 0.3);
+      box-shadow: 0 28px 70px rgba(0, 0, 0, 0.42), inset 0 1px 0 rgba(255,255,255,0.04);
       text-align: center;
       transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
     }
@@ -3040,6 +3080,7 @@ INDEX_HTML = r"""<!doctype html>
       backdrop-filter: blur(20px);
       -webkit-backdrop-filter: blur(20px);
       border-bottom: 1px solid var(--border-color);
+      box-shadow: 0 12px 40px rgba(0,0,0,0.18);
       display: flex;
       justify-content: space-between;
       gap: 16px;
@@ -3843,6 +3884,39 @@ INDEX_HTML = r"""<!doctype html>
         width: 64px;
         height: 64px;
       }
+    }
+
+    .main-card, .active-card, .modal-content, .page-loading-card {
+      box-shadow: 0 22px 70px rgba(0, 0, 0, 0.24), inset 0 1px 0 rgba(255,255,255,0.035);
+    }
+
+    .btn-primary {
+      position: relative;
+      overflow: hidden;
+    }
+
+    .btn-primary::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(120deg, transparent 0%, rgba(255,255,255,0.18) 35%, transparent 70%);
+      transform: translateX(-120%);
+      transition: transform 0.5s ease;
+      pointer-events: none;
+    }
+
+    .btn-primary:hover::after {
+      transform: translateX(120%);
+    }
+
+    .badge.available, .badge.active, .clean-badge, .latency-val.good {
+      box-shadow: 0 0 0 1px rgba(73, 198, 161, 0.08), 0 8px 22px rgba(73, 198, 161, 0.10);
+    }
+
+    .brand-mark, .brand-logo {
+      background-image:
+        linear-gradient(180deg, rgba(158, 209, 251, 0.18), rgba(120, 182, 235, 0.08)),
+        radial-gradient(circle at 78% 82%, rgba(240, 194, 85, 0.22), transparent 35%);
     }
   </style>
 </head>
@@ -5131,6 +5205,9 @@ def background_proxy_checker() -> None:
             if is_connecting:
                 time.sleep(5)
                 continue
+            if not active_openvpn_node_id or not active_openvpn_running():
+                time.sleep(30)
+                continue
 
             res = check_proxy_health()
             if res["ok"]:
@@ -5138,32 +5215,44 @@ def background_proxy_checker() -> None:
                     proxy_ok=True,
                     proxy_ip=res["ip"],
                     proxy_latency_ms=res["latency_ms"],
-                    proxy_error=""
+                    proxy_error="",
+                    proxy_fail_count=0
                 )
                 log_to_json("INFO", "Proxy", f"代理可用，IP: {res['ip']}, 延迟: {res['latency_ms']} ms")
             else:
                 error_msg = res.get("error", "未知错误")
-                if active_openvpn_node_id:
-                    print(f"[警告] 7928 端口本地代理当前不可用！原因: {error_msg}", flush=True)
-                    log_to_json("WARNING", "Proxy", f"代理不可用: {error_msg}")
+                state = read_json(STATE_FILE, {})
+                fail_count = int(state.get("proxy_fail_count") or 0) + 1
+                connected_at = float(state.get("active_connected_at") or 0)
+                in_grace = connected_at and time.time() - connected_at < PROXY_FAIL_GRACE_SECONDS
+                print(f"[警告] 7928 端口本地代理当前不可用！第 {fail_count}/{PROXY_FAIL_AUTO_SWITCH_THRESHOLD} 次，原因: {error_msg}", flush=True)
+                log_to_json("WARNING", "Proxy", f"代理不可用({fail_count}/{PROXY_FAIL_AUTO_SWITCH_THRESHOLD}): {error_msg}")
                 set_state(
                     proxy_ok=False,
                     proxy_ip="-",
                     proxy_latency_ms=0,
-                    proxy_error=error_msg
+                    proxy_error=error_msg,
+                    proxy_fail_count=fail_count,
+                    last_check_message=(
+                        f"代理出口检测暂时失败 {fail_count}/{PROXY_FAIL_AUTO_SWITCH_THRESHOLD}：{error_msg}。"
+                        + ("当前处于连接稳定保护期，不会立即断开。" if in_grace else "")
+                    )
                 )
 
-                # If we intended to have an active VPN node but proxy failed, trigger auto-switch
-                if active_openvpn_node_id:
-                    with lock:
-                        nodes = read_json(NODES_FILE, [])
-                        active_node = next((n for n in nodes if n.get("id") == active_openvpn_node_id), None)
-                        if active_node:
-                            mark_blacklisted(active_node, f"代理连通性检测失败: {error_msg}")
-                            active_node["probe_status"] = "unavailable"
-                            write_json(NODES_FILE, nodes)
-                    
-                    auto_switch_node()
+                # OpenVPN 刚连上时，代理出口可能还在稳定；连续失败达到阈值后才触发故障转移。
+                if in_grace or fail_count < PROXY_FAIL_AUTO_SWITCH_THRESHOLD:
+                    time.sleep(30)
+                    continue
+
+                with lock:
+                    nodes = read_json(NODES_FILE, [])
+                    active_node = next((n for n in nodes if n.get("id") == active_openvpn_node_id), None)
+                    if active_node:
+                        active_node["probe_message"] = f"代理连续失败 {fail_count} 次: {error_msg}"
+                        # 不马上把当前节点标成 unavailable，避免节点池只有当前节点时前端看起来“明明可用却不能连”。
+                        # 是否切换由 auto_switch_node 按备用节点情况决定。
+                        write_json(NODES_FILE, nodes)
+                auto_switch_node()
         except Exception as e:
             print(f"[错误] 代理后台检测发生异常: {e}", flush=True)
             log_to_json("ERROR", "Proxy", f"检测守护线程发生异常: {e}")
@@ -5513,7 +5602,7 @@ class Handler(BaseHTTPRequestHandler):
                 global last_active_ping_time, last_active_latency
                 last_active_ping_time = 0.0
                 last_active_latency = 0
-                set_state(active_openvpn_node_id="", last_check_message="手动断开连接", active_node_latency="无活动连接", failover_country_short="", failover_country="", failover_country_display="未固定")
+                set_state(active_openvpn_node_id="", last_check_message="手动断开连接", active_node_latency="无活动连接", active_connected_at=0, proxy_fail_count=0, failover_country_short="", failover_country="", failover_country_display="未固定")
                 self.send_json({"ok": True})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
