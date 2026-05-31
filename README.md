@@ -83,7 +83,7 @@ en country
 ```bash
 VPNGATE_TARGET_COUNTRIES=JP,日本
 
-# 自动连接/故障转移 IP 类型优先级：默认住宅 IP 优先
+# 自动连接/故障转移 IP 类型优先级：默认住宅优先
 # 可选 residential / mobile / normal / hosting / proxy / all
 # 默认不是硬过滤；无首选类型时会按 住宅 -> 移动 -> 普通/未知 -> 机房 -> 代理IP 逐级兜底。
 TARGET_IP_TYPES=residential
@@ -186,9 +186,11 @@ en uninstall   # 卸载
 
 默认策略：
 
+- 自动检测全部节点后，会从 **全部已检测可用节点** 里按固定地区、IP 类型优先级、欺诈值、黑名单、风险等级和延迟主动优选节点。
 - 自动故障转移采用 **balanced + IP 类型优先级**：先选择首选类型里 `欺诈值 <= 25` 且无黑名单命中的干净备用节点。
 - 默认 IP 类型优先级是 `residential`，即住宅 IP 优先；但如果当前国家没有住宅 IP，不会停摆，会按移动/普通/机房/代理逐级兜底。
 - 代理 IP 是最后兜底选项：只有前面类型都没有可用节点时才会参与自动故障转移。
+- 如果当前已经连接的是代理/高风险节点，后面检测到同地区住宅 IP / 移动 IP / 更低风险节点，会自动择优切换；有冷却时间避免频繁跳节点。这个功能可在 Web 面板「管理员 → 面板设置 → 检测完成后自动优选节点」里开关。
 - 手动切换不会被风控硬拦截：高风险/未检测节点会弹出提示，确认后仍可强制尝试。
 - 如果想让自动故障转移绝对严格，可设置 `AUTO_RISK_MODE=strict` 且 `AUTO_MIN_KEEP_RUNNING=0`。
 - 如果想完全禁止手动强制切换，可设置 `ALLOW_MANUAL_RISKY_CONNECT=0`。
@@ -216,6 +218,30 @@ ALLOW_RISKY_IP_CONNECT=0
 # 是否允许面板手动确认后强制尝试风险节点，默认开启
 ALLOW_MANUAL_RISKY_CONNECT=1
 
+# 是否自动检测拉取到的全部节点，默认开启；关闭后只检测前 10 个
+AUTO_TEST_ALL_NODES=1
+
+# 自动检测最多检测多少个节点，0 表示不额外限制，最多受 MAX_SCAN_ROWS 限制
+AUTO_TEST_MAX_NODES=0
+
+# 自动检测 OpenVPN 握手并发数，默认 8；VPS 配置低建议 3-5
+AUTO_TEST_WORKERS=8
+
+# 单个节点 OpenVPN 批量检测超时时间，默认 12 秒
+OPENVPN_BATCH_TEST_TIMEOUT_SECONDS=12
+
+# 检测完成后是否从所有可用节点中主动选择更优节点，默认开启；也可在 Web 面板设置中开关
+AUTO_SELECT_BEST_NODE=1
+
+# 自动优选切换冷却时间，避免频繁跳节点，默认 600 秒
+AUTO_SELECT_COOLDOWN_SECONDS=600
+
+# 欺诈值至少降低多少才触发自动择优切换，默认 20
+AUTO_SWITCH_MIN_FRAUD_DELTA=20
+
+# 同风险等级下延迟至少降低多少毫秒才触发自动择优切换，默认 300ms
+AUTO_SWITCH_MIN_LATENCY_DELTA_MS=300
+
 # 是否启用 DNSBL 黑名单检测，默认开启
 IP_DNSBL_CHECK=1
 
@@ -234,7 +260,7 @@ IP_RISK_CACHE_TTL_SECONDS=86400
 
 ### IP 类型优先级说明
 
-默认 `TARGET_IP_TYPES=residential` 的含义是：**优先选择住宅 IP**，不是“没有住宅 IP 就不运行”。自动故障转移会按以下顺序兜底：
+默认 `TARGET_IP_TYPES=residential` 的含义是：**住宅优先**，不是“只允许住宅”。自动故障转移会按以下顺序兜底：
 
 ```text
 住宅 IP -> 移动 IP -> 普通/未知 -> 机房 IP -> 代理 IP/Tor
@@ -245,3 +271,12 @@ IP_RISK_CACHE_TTL_SECONDS=86400
 ```bash
 STRICT_IP_TYPE_FILTER=1
 ```
+
+### 自动检测全部节点 + 自动优选
+
+新版默认会在每次拉取节点后自动检测全部非活动节点，不再只检测前 10 个。为了防止 VPS 被大量 OpenVPN 进程拖死，检测会按 `AUTO_TEST_WORKERS` 控制并发，默认 8 个并发。面板会每 10 秒自动刷新检测进度，不需要手动刷新。
+
+检测完成后会执行自动优选：从全部 `available` 节点中，先按固定地区范围筛选，再按 IP 类型优先级、黑名单、欺诈值、风险等级、延迟排序。也就是说，如果当前连着代理 IP，后面检测到同地区住宅 IP 或移动 IP，程序会自动切到更优节点；如果没有住宅/移动，也会继续按普通、机房、代理逐级兜底，保证服务不会停摆。
+
+为了避免频繁跳节点，自动优选有冷却时间：默认 10 分钟。你可以在 Web 面板设置里关闭「检测完成后自动优选节点」，也可以通过 `AUTO_SELECT_COOLDOWN_SECONDS` 调整冷却时间，或者设置 `AUTO_SELECT_BEST_NODE=0` 关闭主动择优，只保留断线故障转移。
+

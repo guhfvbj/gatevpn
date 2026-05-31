@@ -70,6 +70,22 @@ TARGET_IP_TYPES_ENV = os.environ.get("TARGET_IP_TYPES") or os.environ.get("AUTO_
 # 1 = 恢复旧逻辑，把 TARGET_IP_TYPES 当作硬过滤；0 = 默认，将其作为优先级，必要时兜底到代理 IP 保持运行。
 STRICT_IP_TYPE_FILTER = os.environ.get("STRICT_IP_TYPE_FILTER", "0").strip().lower() in {"1", "true", "yes", "on"}
 
+# 自动节点检测策略。默认会检测本轮拉取/缓存中的全部非活动节点，
+# 但会限制并发数量，避免一次性拉起过多 OpenVPN 进程导致 VPS 卡死。
+AUTO_TEST_ALL_NODES = os.environ.get("AUTO_TEST_ALL_NODES", "1").strip().lower() not in {"0", "false", "no", "off"}
+AUTO_TEST_MAX_NODES = int(os.environ.get("AUTO_TEST_MAX_NODES", "0"))  # 0 = 不额外限制，最多受 MAX_SCAN_ROWS 影响
+AUTO_TEST_WORKERS = max(1, int(os.environ.get("AUTO_TEST_WORKERS", "8")))
+OPENVPN_BATCH_TEST_TIMEOUT_SECONDS = int(os.environ.get("OPENVPN_BATCH_TEST_TIMEOUT_SECONDS", "12"))
+
+# 自动优选策略：全部节点检测完成后，主动从已检测可用节点中按地区、IP类型、风控、延迟重新选择更优节点。
+# 这不是只在断线时才切换；如果当前节点明显比候选节点差，也会自动换到更优节点。
+# AUTO_SELECT_BEST_NODE 环境变量存在时优先级最高；未设置时可在 Web 面板里开关。
+AUTO_SELECT_BEST_NODE_ENV = os.environ.get("AUTO_SELECT_BEST_NODE")
+AUTO_SELECT_BEST_NODE = (AUTO_SELECT_BEST_NODE_ENV or "1").strip().lower() not in {"0", "false", "no", "off"}
+AUTO_SELECT_COOLDOWN_SECONDS = int(os.environ.get("AUTO_SELECT_COOLDOWN_SECONDS", "600"))
+AUTO_SWITCH_MIN_FRAUD_DELTA = int(os.environ.get("AUTO_SWITCH_MIN_FRAUD_DELTA", "20"))
+AUTO_SWITCH_MIN_LATENCY_DELTA_MS = int(os.environ.get("AUTO_SWITCH_MIN_LATENCY_DELTA_MS", "300"))
+
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ["VPNGATE_DATA_DIR"]).resolve() if os.environ.get("VPNGATE_DATA_DIR") else ROOT_DIR / "vpngate_data"
 CONFIG_DIR = DATA_DIR / "configs"
@@ -146,7 +162,8 @@ def load_ui_config() -> dict[str, Any]:
             "host": "0.0.0.0",
             "port": 8787,
             "target_countries": TARGET_COUNTRIES_ENV,
-            "target_ip_types": TARGET_IP_TYPES_ENV or "residential"
+            "target_ip_types": TARGET_IP_TYPES_ENV or "residential",
+            "auto_select_best_node": AUTO_SELECT_BEST_NODE
         }
         updated = False
         if auth_file.exists():
@@ -160,6 +177,8 @@ def load_ui_config() -> dict[str, Any]:
             config["target_countries"] = TARGET_COUNTRIES_ENV
         if TARGET_IP_TYPES_ENV:
             config["target_ip_types"] = TARGET_IP_TYPES_ENV
+        if AUTO_SELECT_BEST_NODE_ENV is not None and AUTO_SELECT_BEST_NODE_ENV.strip():
+            config["auto_select_best_node"] = AUTO_SELECT_BEST_NODE
         
         if not config.get("username"):
             config["username"] = generate_random_username()
@@ -264,6 +283,25 @@ def ip_type_display(value: Any) -> str:
         "proxy": "代理IP",
         "tor": "Tor出口",
     }.get(token, str(value or ""))
+
+
+def parse_bool_setting(value: Any, default: bool = True) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on", "enable", "enabled", "开启"}:
+        return True
+    if text in {"0", "false", "no", "off", "disable", "disabled", "关闭"}:
+        return False
+    return default
+
+def get_auto_select_best_node() -> bool:
+    if AUTO_SELECT_BEST_NODE_ENV is not None and AUTO_SELECT_BEST_NODE_ENV.strip():
+        return AUTO_SELECT_BEST_NODE
+    cfg = load_ui_config()
+    return parse_bool_setting(cfg.get("auto_select_best_node"), AUTO_SELECT_BEST_NODE)
 
 def target_ip_types_display(value: Any) -> str:
     types = split_target_ip_types(value)
@@ -622,6 +660,122 @@ def set_failover_scope_from_node(node: dict[str, Any]) -> None:
         strict_country_failover=STRICT_COUNTRY_FAILOVER,
     )
 
+
+
+def auto_selection_key_summary(node: dict[str, Any]) -> str:
+    return (
+        f"IP类型 {ip_type_display(node.get('ip_type') or node.get('quality') or 'unknown')} / "
+        f"欺诈值 {node.get('fraud_score', '未知')} / "
+        f"黑名单 {node.get('blacklist_count', 0)} / "
+        f"延迟 {node.get('latency_ms') or node.get('ping') or '-'} ms"
+    )
+
+def should_switch_to_better_node(active_node: dict[str, Any] | None, best_node: dict[str, Any]) -> tuple[bool, str]:
+    """Return whether an already-running connection should be replaced by a better tested node.
+
+    The goal is to use full-node detection results, but avoid unstable constant switching.
+    We switch when the candidate has a clearly better IP tier/risk score/fraud score,
+    or a meaningfully lower latency.
+    """
+    if not active_node:
+        return True, "当前没有活动节点"
+    if best_node.get("id") == active_node.get("id"):
+        return False, "当前节点已经是本轮优选节点"
+
+    active_status = str(active_node.get("probe_status") or "").lower()
+    if active_status not in {"available", ""}:
+        return True, "当前活动节点状态异常"
+
+    active_blacklist = parse_int(active_node.get("blacklist_count"))
+    best_blacklist = parse_int(best_node.get("blacklist_count"))
+    if best_blacklist < active_blacklist:
+        return True, f"候选节点黑名单命中更少：{active_blacklist} -> {best_blacklist}"
+
+    active_ip_rank = node_ip_priority_rank(active_node)
+    best_ip_rank = node_ip_priority_rank(best_node)
+    if best_ip_rank + 1 < active_ip_rank:
+        return True, f"候选节点 IP 类型/风控等级明显更优：{auto_selection_key_summary(active_node)} -> {auto_selection_key_summary(best_node)}"
+
+    active_fraud = node_fraud_score(active_node, unknown=80)
+    best_fraud = node_fraud_score(best_node, unknown=80)
+    if active_fraud - best_fraud >= AUTO_SWITCH_MIN_FRAUD_DELTA:
+        return True, f"候选节点欺诈值明显更低：{active_fraud} -> {best_fraud}"
+
+    active_risk = str(active_node.get("risk_level") or "unknown").lower()
+    best_risk = str(best_node.get("risk_level") or "unknown").lower()
+    risk_order = {"clean": 0, "low": 1, "unknown": 2, "medium": 3, "high": 4, "blocked": 5}
+    if risk_order.get(best_risk, 2) + 1 < risk_order.get(active_risk, 2):
+        return True, f"候选节点风险等级明显更低：{active_risk} -> {best_risk}"
+
+    # Only use latency to switch when the risk/IP tier is not worse, and improvement is obvious.
+    active_latency = parse_int(active_node.get("latency_ms")) or parse_int(active_node.get("ping")) or 999999
+    best_latency = parse_int(best_node.get("latency_ms")) or parse_int(best_node.get("ping")) or 999999
+    if best_ip_rank <= active_ip_rank and best_fraud <= active_fraud and active_latency - best_latency >= AUTO_SWITCH_MIN_LATENCY_DELTA_MS:
+        return True, f"候选节点延迟明显更低：{active_latency} ms -> {best_latency} ms"
+
+    return False, "候选节点没有明显优于当前活动节点，避免频繁跳节点"
+
+def optimize_active_node_after_tests(reason: str = "") -> str:
+    """After batch testing, actively select the best available node from all tested nodes.
+
+    This closes the gap where the panel showed tested residential/mobile nodes but the service
+    stayed on an older proxy/high-risk node until failure. Automatic selection still respects
+    country scope and IP-type preference, but it is not a dead-end filter.
+    """
+    if not get_auto_select_best_node():
+        return "自动优选已关闭"
+
+    with lock:
+        nodes = read_json(NODES_FILE, [])
+        active_node = next((n for n in nodes if n.get("id") == active_openvpn_node_id or n.get("active")), None)
+        available = [n for n in nodes if n.get("probe_status") == "available"]
+
+    if not available:
+        msg = "自动优选：暂无已检测可用节点"
+        set_state(last_auto_select_message=msg)
+        return msg
+
+    failover_targets = get_failover_targets(active_node)
+    scoped = [n for n in available if node_matches_target_countries(n, failover_targets)] if failover_targets else list(available)
+    candidates, candidate_reason = choose_auto_failover_candidates(scoped, available)
+    if not candidates:
+        msg = f"自动优选：没有符合当前地区/IP策略的可用节点；{candidate_reason}"
+        set_state(last_auto_select_message=msg)
+        return msg
+
+    best_node = candidates[0]
+    should_switch, switch_reason = should_switch_to_better_node(active_node, best_node)
+    if not should_switch:
+        msg = f"自动优选：保持当前节点；{switch_reason}；策略：{candidate_reason}"
+        set_state(last_auto_select_message=msg)
+        return msg
+
+    state = read_json(STATE_FILE, {})
+    now = time.time()
+    last_switch = float(state.get("last_auto_select_switch_at") or 0)
+    if active_openvpn_running() and last_switch > 0 and now - last_switch < AUTO_SELECT_COOLDOWN_SECONDS:
+        left = int(AUTO_SELECT_COOLDOWN_SECONDS - (now - last_switch))
+        msg = f"自动优选：发现更优节点 {best_node.get('id')}，但冷却中，约 {left} 秒后再自动切换；原因：{switch_reason}"
+        set_state(last_auto_select_message=msg)
+        return msg
+
+    clean_ok = node_is_clean_for_connect(best_node)
+    msg = (
+        f"自动优选：从全部已检测节点中选择 {best_node.get('id')}；"
+        f"{auto_selection_key_summary(best_node)}；原因：{switch_reason}；策略：{candidate_reason}"
+    )
+    print(f"[自动优选] {msg}", flush=True)
+    log_to_json("INFO", "VPN", msg)
+    set_state(last_auto_select_message=msg, last_check_message=msg, last_auto_select_switch_at=now)
+    try:
+        return connect_node(best_node["id"], update_failover_scope=False, allow_auto_risky=not clean_ok)
+    except Exception as e:
+        err = f"自动优选切换失败：{e}"
+        print(f"[自动优选] {err}", flush=True)
+        log_to_json("WARNING", "VPN", err)
+        set_state(last_auto_select_message=err, last_check_message=err)
+        return err
+
 def get_session_token(password: str, username: str = "admin") -> str:
     salt = "eianun_vpngate_secure_salt_2026"
     return hashlib.sha256((username + ":" + password + salt).encode("utf-8")).hexdigest()
@@ -705,6 +859,18 @@ def get_state() -> dict[str, Any]:
     state["strict_ip_type_filter"] = STRICT_IP_TYPE_FILTER
     state["allow_risky_ip_connect"] = ALLOW_RISKY_IP_CONNECT
     state["allow_manual_risky_connect"] = ALLOW_MANUAL_RISKY_CONNECT
+    state["auto_test_all_nodes"] = AUTO_TEST_ALL_NODES
+    state["auto_test_max_nodes"] = AUTO_TEST_MAX_NODES
+    state["auto_test_workers"] = AUTO_TEST_WORKERS
+    state["openvpn_batch_test_timeout_seconds"] = OPENVPN_BATCH_TEST_TIMEOUT_SECONDS
+    state["auto_select_best_node"] = get_auto_select_best_node()
+    state["auto_select_cooldown_seconds"] = AUTO_SELECT_COOLDOWN_SECONDS
+    state["auto_switch_min_fraud_delta"] = AUTO_SWITCH_MIN_FRAUD_DELTA
+    state["auto_switch_min_latency_delta_ms"] = AUTO_SWITCH_MIN_LATENCY_DELTA_MS
+    state.setdefault("auto_test_total", 0)
+    state.setdefault("auto_test_done", 0)
+    state.setdefault("last_auto_select_switch_at", 0)
+    state.setdefault("last_auto_select_message", "")
     
     return state
 
@@ -1204,10 +1370,22 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
 def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
     with lock:
         nodes = read_json(NODES_FILE, [])
-        to_test = [n for n in nodes if n.get("id") in node_ids]
+        requested = set(node_ids)
+        to_test = [n for n in nodes if n.get("id") in requested]
+
+    if not to_test:
+        return []
+
+    total = len(to_test)
+    worker_count = min(AUTO_TEST_WORKERS, total)
+    set_state(
+        last_check_message=f"正在自动检测节点 0/{total}，并发 {worker_count}，请稍候...",
+        auto_test_total=total,
+        auto_test_done=0,
+        auto_test_workers=worker_count,
+    )
         
-    def test_worker(args: tuple[int, dict[str, Any]]) -> dict[str, Any]:
-        idx, n_info = args
+    def test_worker(n_info: dict[str, Any]) -> dict[str, Any]:
         node_id = n_info["id"]
         config_file = n_info["config_file"]
         config_text = n_info.get("config_text") or ""
@@ -1223,8 +1401,17 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
             pass
             
         latency = vpn_utils.ping_latency_ms(h, p, fallback_ping)
-        dev_name = f"tun{idx + 1}"
-        ok, message, _ = run_openvpn_until_ready(config_file, keep_alive=False, route_nopull=True, timeout=12, dev=dev_name)
+        idx = get_free_test_index()
+        try:
+            ok, message, _ = run_openvpn_until_ready(
+                config_file,
+                keep_alive=False,
+                route_nopull=True,
+                timeout=OPENVPN_BATCH_TEST_TIMEOUT_SECONDS,
+                dev=f"tun{idx}",
+            )
+        finally:
+            release_test_index(idx)
         
         try:
             if temp_path.exists():
@@ -1277,8 +1464,9 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
         return temp_node
 
     updated_nodes_map = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(to_test))) as executor:
-        futures = {executor.submit(test_worker, (idx, n)): n["id"] for idx, n in enumerate(to_test)}
+    completed = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = {executor.submit(test_worker, n): n["id"] for n in to_test}
         for future in concurrent.futures.as_completed(futures):
             nid = futures[future]
             try:
@@ -1289,8 +1477,25 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
                     "id": nid,
                     "probe_status": "unavailable",
                     "probe_message": f"Test exception: {e}",
-                    "latency_ms": 0
+                    "latency_ms": 0,
+                    "probed_at": time.time(),
+                    "fraud_score": 0,
+                    "clean_score": 0,
+                    "risk_level": "unknown",
+                    "fraud_flags": [],
+                    "risk_sources": [],
+                    "blacklist_hits": [],
+                    "blacklist_count": 0,
+                    "ip_clean": False,
                 }
+            completed += 1
+            if completed == total or completed % max(1, min(10, worker_count)) == 0:
+                set_state(
+                    last_check_message=f"正在自动检测节点 {completed}/{total}，已完成 {completed} 个...",
+                    auto_test_total=total,
+                    auto_test_done=completed,
+                    auto_test_workers=worker_count,
+                )
                 
     with lock:
         current_nodes = read_json(NODES_FILE, [])
@@ -1300,7 +1505,15 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
                 n.update(updated_nodes_map[nid])
         sorted_nodes = sort_all_nodes(current_nodes)
         write_json(NODES_FILE, sorted_nodes)
-        
+        available_count = len([n for n in sorted_nodes if n.get("probe_status") == "available"])
+        unavailable_count = len([n for n in sorted_nodes if n.get("probe_status") == "unavailable"])
+
+    set_state(
+        last_check_message=f"自动检测完成：共检测 {total} 个，可用 {available_count} 个，不可用 {unavailable_count} 个。",
+        auto_test_total=total,
+        auto_test_done=total,
+        auto_test_workers=worker_count,
+    )
     return list(updated_nodes_map.values())
 
 def auto_switch_node(attempt: int = 0) -> None:
@@ -1540,27 +1753,45 @@ def maintain_valid_nodes(force: bool = False, target_override: list[str] | None 
                         
             write_json(NODES_FILE, merged)
 
-        # Test the first 10 non-active nodes from the new list
+        # 自动检测节点：默认检测本轮拉取/缓存中的全部非活动节点，但限制并发，避免 VPS 过载。
         with lock:
             current_nodes = read_json(NODES_FILE, [])
-            to_test = [n for n in current_nodes if not n.get("active")][:10]
+            test_candidates = [n for n in current_nodes if not n.get("active")]
+            if AUTO_TEST_ALL_NODES:
+                to_test = test_candidates
+                if AUTO_TEST_MAX_NODES > 0:
+                    to_test = to_test[:AUTO_TEST_MAX_NODES]
+            else:
+                to_test = test_candidates[:10]
             to_test_ids = [n["id"] for n in to_test]
+            total_candidates = len(test_candidates)
             
-        print(f"[维护线程] 正在检测新获取列表的前 10 个节点: {to_test_ids}", flush=True)
-        set_state(is_connecting=True, last_check_message="正在并发检测筛选可用节点，这可能需要 5-30 秒...")
-        test_multiple_nodes(to_test_ids)
+        print(f"[维护线程] 正在自动检测节点: {len(to_test_ids)}/{total_candidates}，并发 {min(AUTO_TEST_WORKERS, max(1, len(to_test_ids)))}", flush=True)
+        set_state(
+            is_connecting=True,
+            last_check_message=f"正在自动检测节点 0/{len(to_test_ids)}，这可能需要几分钟...",
+            auto_test_total=len(to_test_ids),
+            auto_test_done=0,
+            auto_test_workers=min(AUTO_TEST_WORKERS, max(1, len(to_test_ids))) if to_test_ids else 0,
+        )
+        if to_test_ids:
+            test_multiple_nodes(to_test_ids)
         
         is_connecting = False
         
         with lock:
             merged = read_json(NODES_FILE, [])
+            available_candidates = [n for n in merged if n.get("probe_status") == "available"]
+
+        if available_candidates:
             if not active_openvpn_running():
-                available_candidates = [n for n in merged if n.get("probe_status") == "available"]
-                if available_candidates:
-                    auto_switch_node()
+                auto_switch_node()
+            elif get_auto_select_best_node():
+                # 检测全部节点后，主动从所有已检测可用节点中按地区/IP类型/风控/延迟选更优节点。
+                optimize_active_node_after_tests("batch_test_finished")
 
         valid_nodes_count = len([n for n in merged if n.get("probe_status") == "available"])
-        message = f"Fetched {len(candidates)} nodes. Tested first 10 nodes."
+        message = f"Fetched {len(candidates)} nodes. Tested {len(to_test_ids)} of {total_candidates} nodes. Auto select: {'on' if get_auto_select_best_node() else 'off'}."
         set_state(
             last_check_at=time.time(),
             last_check_message=message,
@@ -2868,12 +3099,21 @@ INDEX_HTML = r"""<!doctype html>
           <div class="form-group" style="margin-bottom: 12px;">
             <label class="form-label" for="settings_target_ip_types">自动选择 IP 类型优先级</label>
             <select id="settings_target_ip_types" class="input-field">
-              <option value="residential">住宅 IP 优先，最后代理 IP 兜底</option>
-              <option value="residential,mobile">住宅 IP，其次移动 IP，最后代理 IP 兜底</option>
-              <option value="residential,normal,mobile">住宅 / 普通未知 / 移动优先，最后代理 IP 兜底</option>
-              <option value="all">全部类型按风险/延迟排序</option>
+              <option value="residential">住宅优先（推荐）</option>
+              <option value="mobile,residential">移动优先</option>
+              <option value="normal,residential,mobile">普通/未知优先</option>
+              <option value="all">不限类型</option>
             </select>
-            <div style="font-size: 12px; color: var(--text-secondary); margin-top: 6px; line-height: 1.4;">默认不是硬过滤：会先找你选择的类型；没有时按住宅 → 移动 → 普通/未知 → 机房 → 代理 IP 逐级兜底，避免自动故障转移停摆。手动切换仍可确认后强制尝试。</div>
+            <div style="font-size: 12px; color: var(--text-secondary); margin-top: 6px; line-height: 1.4;">这是优先级，不是硬过滤。自动故障转移会先按所选类型找节点；没有合适节点时再逐级兜底，代理/Tor 默认排在最后，避免服务停摆。手动切换仍可确认后强制尝试。</div>
+          </div>
+
+          <div class="form-group" style="margin-bottom: 12px;">
+            <label class="form-label" for="settings_auto_select_best_node">检测完成后自动优选节点</label>
+            <select id="settings_auto_select_best_node" class="input-field">
+              <option value="1">开启：检测后主动切到更优节点（推荐）</option>
+              <option value="0">关闭：只在断线/失效时故障转移</option>
+            </select>
+            <div style="font-size: 12px; color: var(--text-secondary); margin-top: 6px; line-height: 1.4;">对应 AUTO_SELECT_BEST_NODE。关闭后不会因为检测到住宅/移动等更优节点而主动跳转，但节点失效时仍会自动故障转移。</div>
           </div>
 
           <div class="form-group" style="margin-bottom: 12px;">
@@ -3706,7 +3946,13 @@ function openSettingsModal() {
     $("settings_port").value = state.port || 8787;
     $("settings_suffix").value = state.secret_path || "EJsW2EeBo9lY";
     $("settings_target_countries").value = state.target_countries || "";
-    $("settings_target_ip_types").value = state.target_ip_types || "residential";
+    const ipTypeValue = state.target_ip_types || "residential";
+    const legacyIpTypeMap = {
+      "residential,mobile": "residential",
+      "residential,normal,mobile": "residential"
+    };
+    $("settings_target_ip_types").value = legacyIpTypeMap[ipTypeValue] || ipTypeValue;
+    $("settings_auto_select_best_node").value = state.auto_select_best_node ? "1" : "0";
   }
   
   $("settings_modal").style.display = "flex";
@@ -3730,6 +3976,7 @@ async function saveSettings(e) {
   const suffix = $("settings_suffix").value.trim();
   const targetCountries = $("settings_target_countries").value.trim();
   const targetIpTypes = $("settings_target_ip_types").value.trim();
+  const autoSelectBestNode = $("settings_auto_select_best_node").value === "1";
   const newUsername = $("settings_new_username").value.trim();
   const newPassword = $("settings_new_password").value.trim();
   const currUsername = $("settings_curr_username").value.trim();
@@ -3759,6 +4006,7 @@ async function saveSettings(e) {
         secret_path: suffix,
         target_countries: targetCountries,
         target_ip_types: targetIpTypes,
+        auto_select_best_node: autoSelectBestNode,
         new_username: newUsername,
         new_password: newPassword,
         curr_username: currUsername,
@@ -3771,7 +4019,7 @@ async function saveSettings(e) {
       successDiv.textContent = "保存成功！页面将在 4 秒内自动跳转至新地址...";
       successDiv.style.display = "block";
       
-      const inputs = $("settings_form").querySelectorAll("input, button");
+      const inputs = $("settings_form").querySelectorAll("input, select, button");
       inputs.forEach(el => el.disabled = true);
       
       setTimeout(() => {
@@ -3810,7 +4058,7 @@ load();
 
 // 每 10 秒在前台空闲时自动更新节点与状态，无需手动刷新页面
 setInterval(async () => {
-  if (typeof state !== "undefined" && !state.is_connecting && (!testingNodeIds || !testingNodeIds.size) && document.visibilityState === "visible") {
+  if (typeof state !== "undefined" && (!testingNodeIds || !testingNodeIds.size) && document.visibilityState === "visible") {
     try {
       const r = await fetch("./api/nodes");
       const d = await r.json();
@@ -4177,6 +4425,7 @@ class Handler(BaseHTTPRequestHandler):
                 new_suffix = str(payload.get("secret_path") or "").strip()
                 new_target_countries = normalize_target_countries_input(payload.get("target_countries") or "")
                 new_target_ip_types = normalize_target_ip_types_input(payload.get("target_ip_types") or TARGET_IP_TYPES_ENV or "residential")
+                new_auto_select_best_node = parse_bool_setting(payload.get("auto_select_best_node"), True)
                 new_username = str(payload.get("new_username") or "").strip()
                 new_password = str(payload.get("new_password") or "").strip()
                 
@@ -4208,6 +4457,7 @@ class Handler(BaseHTTPRequestHandler):
                 ui_cfg["secret_path"] = new_suffix
                 ui_cfg["target_countries"] = new_target_countries
                 ui_cfg["target_ip_types"] = new_target_ip_types
+                ui_cfg["auto_select_best_node"] = new_auto_select_best_node
                 if new_username:
                     ui_cfg["username"] = new_username
                 if new_password:
@@ -4232,7 +4482,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if effective_path == "/api/check":
             try:
-                self.send_json({"ok": True, "message": maintain_valid_nodes(force=True)})
+                threading.Thread(target=maintain_valid_nodes, kwargs={"force": True}, daemon=True).start()
+                self.send_json({"ok": True, "message": "已在后台启动完整节点检测流程，面板会持续刷新检测进度"})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/refresh_nodes":

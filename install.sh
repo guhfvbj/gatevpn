@@ -861,16 +861,16 @@ def configure_iptype():
     print("=======================================================")
     current = cfg.get('target_ip_types', 'residential') or 'all'
     print(f"当前自动IP优先级: {current}")
-    print("  [1] 住宅IP优先，最后代理IP兜底 (residential，推荐)")
-    print("  [2] 住宅IP，其次移动IP，最后代理IP兜底 (residential,mobile)")
-    print("  [3] 住宅/普通未知/移动优先，最后代理IP兜底 (residential,normal,mobile)")
-    print("  [4] 全部类型按风险/延迟排序 (all)")
-    print("  [5] 自定义优先级，例如 residential,mobile")
+    print("  [1] 住宅优先（推荐）")
+    print("  [2] 移动优先")
+    print("  [3] 普通/未知优先")
+    print("  [4] 不限类型")
+    print("  [5] 自定义优先级，例如 residential,mobile,normal")
     sel = input("请选择 [1-5, 回车默认1]: ").strip() or '1'
     mapping = {
         '1': 'residential',
-        '2': 'residential,mobile',
-        '3': 'residential,normal,mobile',
+        '2': 'mobile,residential',
+        '3': 'normal,residential,mobile',
         '4': 'all',
     }
     if sel == '5':
@@ -880,7 +880,7 @@ def configure_iptype():
     cfg['target_ip_types'] = val
     save_ui_cfg(cfg)
     print(f"自动IP类型优先级已更新为: {val}")
-    print("说明: 默认不是硬过滤；无首选类型时会按住宅 -> 移动 -> 普通/未知 -> 机房 -> 代理IP逐级兜底，避免自动故障转移停摆。")
+    print("说明: 这是优先级，不是硬过滤；代理/Tor 默认排在最后，避免自动故障转移停摆。")
     ask_restart()
 
 def getch():
@@ -1173,7 +1173,7 @@ case "$is_custom" in
         done
         ask "请输入节点拉取地区 [留空=全部地区，例如 JP,日本,US]: "
         TARGET_COUNTRIES_INPUT="$REPLY_VALUE"
-        ask "请输入自动IP类型优先级 [默认 residential，可填 all/residential,mobile]: "
+        ask "请输入自动IP类型优先级 [默认 residential，可填 all/mobile,residential/normal,residential,mobile]: "
         iptype_input="$REPLY_VALUE"
         if [ -n "$iptype_input" ]; then TARGET_IP_TYPES_INPUT="$iptype_input"; fi
         ;;
