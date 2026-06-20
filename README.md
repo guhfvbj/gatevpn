@@ -276,6 +276,12 @@ sudo en multi add kr --country "KR,韩国" --port 7929 --iptype all
 sudo en multi add us --country "US,美国" --port 7930 --iptype all
 ```
 
+新增实例时也可以直接设置节点选择策略和定时测速间隔，例如每 1 小时测速一次并采用粘性选择：
+
+```bash
+sudo en multi add jp --country "JP,日本" --port 7928 --iptype all --selection-mode sticky --benchmark-interval 3600
+```
+
 启动、停止和重启：
 
 ```bash
@@ -340,6 +346,30 @@ sudo en multi best jp
 ```
 
 `en multi status jp` 会显示当前选中节点、选择来源、benchmark 时间、当前节点排名、`final_score`、代理延迟和 benchmark 出口 IP，方便确认实例是否正在使用测速优选节点。
+
+### 定时测速与选择策略
+
+已有实例可以通过 `policy` 调整策略：
+
+```bash
+sudo en multi policy jp --benchmark-interval 3600 --selection-mode sticky
+sudo en multi restart jp
+```
+
+`--benchmark-interval` 单位是秒，`3600` 表示每 1 小时测速一次，`0` 表示关闭运行期定时测速。策略变更写入实例 env 文件，实例正在运行时需要重启后生效。
+
+节点选择模式：
+
+- `sticky`：粘性选择。定时测速后，如果当前节点仍然 `connect_ok/proxy_ok`，并且 `final_score` 不低于阈值、代理延迟不超过阈值，就继续使用当前节点；只有当前节点坏掉或明显变差时才切换。
+- `benchmark`：完全按测速选择。每次 benchmark 后都选择 `final_score` 最高且可连接、代理可用的节点。
+
+粘性阈值也可以调整：
+
+```bash
+sudo en multi policy jp --selection-mode sticky --benchmark-interval 3600 --sticky-min-score 30 --sticky-max-latency 3000
+```
+
+实例运行中到达定时测速间隔后，会用临时 namespace 执行 benchmark，不污染宿主机默认路由，也不占用当前实例的 SOCKS5 端口。若策略选出了不同节点，服务会触发该国家实例重启并切到新的 `best.ovpn`；不会跨国家切换。
 
 测速并固定最优节点：
 

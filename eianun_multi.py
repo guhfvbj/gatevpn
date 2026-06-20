@@ -107,6 +107,13 @@ def int_value(value: Any, default: int = 0) -> int:
         return default
 
 
+def float_value(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(str(value).strip())
+    except Exception:
+        return default
+
+
 def bool_value(value: Any, default: bool = False) -> bool:
     if value is None:
         return default
@@ -126,6 +133,10 @@ class InstanceConfig:
     auto_test_workers: int
     auto_select_best_node: bool
     allow_active_switch: bool
+    node_selection_mode: str
+    benchmark_interval_seconds: int
+    sticky_min_final_score: float
+    sticky_max_proxy_latency_ms: int
     health_check_url: str
     openvpn_dev_name: str
     runtime_dir: Path
@@ -166,6 +177,10 @@ class InstanceConfig:
             auto_test_workers=max(1, int_value(env.get("AUTO_TEST_WORKERS"), 4)),
             auto_select_best_node=bool_value(env.get("AUTO_SELECT_BEST_NODE"), True),
             allow_active_switch=bool_value(env.get("ALLOW_ACTIVE_SWITCH"), True),
+            node_selection_mode=(env.get("NODE_SELECTION_MODE") or "sticky").strip().lower(),
+            benchmark_interval_seconds=max(0, int_value(env.get("BENCHMARK_INTERVAL_SECONDS"), 0)),
+            sticky_min_final_score=float_value(env.get("STICKY_MIN_FINAL_SCORE"), 30.0),
+            sticky_max_proxy_latency_ms=max(1, int_value(env.get("STICKY_MAX_PROXY_LATENCY_MS"), 3000)),
             health_check_url=env.get("HEALTH_CHECK_URL") or "https://api.ipify.org",
             openvpn_dev_name=env.get("OPENVPN_DEV_NAME") or f"tun-vg-{instance_id}",
             runtime_dir=runtime_dir,
@@ -197,7 +212,17 @@ def instance_veth_ips(instance_id: str) -> tuple[str, str]:
     return f"169.254.{third}.{fourth_base + 1}", f"169.254.{third}.{fourth_base + 2}"
 
 
-def default_instance_values(instance_id: str, country: str, port: int, iptype: str) -> dict[str, Any]:
+def default_instance_values(
+    instance_id: str,
+    country: str,
+    port: int,
+    iptype: str,
+    *,
+    selection_mode: str = "sticky",
+    benchmark_interval: int = 0,
+    sticky_min_score: float = 30.0,
+    sticky_max_latency: int = 3000,
+) -> dict[str, Any]:
     return {
         "INSTANCE_ID": instance_id,
         "DISPLAY_NAME": f"VPNGate-{instance_id.upper()}-01",
@@ -210,6 +235,10 @@ def default_instance_values(instance_id: str, country: str, port: int, iptype: s
         "AUTO_TEST_WORKERS": 4,
         "AUTO_SELECT_BEST_NODE": "true",
         "ALLOW_ACTIVE_SWITCH": "true",
+        "NODE_SELECTION_MODE": selection_mode,
+        "BENCHMARK_INTERVAL_SECONDS": benchmark_interval,
+        "STICKY_MIN_FINAL_SCORE": sticky_min_score,
+        "STICKY_MAX_PROXY_LATENCY_MS": sticky_max_latency,
         "HEALTH_CHECK_URL": "https://api.ipify.org",
         "OPENVPN_DEV_NAME": f"tun-vg-{instance_id}",
         "RUNTIME_DIR": str(RUN_ROOT / instance_id),
@@ -279,7 +308,16 @@ def add_instance(args: argparse.Namespace) -> None:
         die(f"实例已存在: {instance_id}，如需覆盖请加 --force")
     if port_in_use("127.0.0.1", args.port):
         die(f"端口已被占用: 127.0.0.1:{args.port}")
-    values = default_instance_values(instance_id, args.country, args.port, args.iptype)
+    values = default_instance_values(
+        instance_id,
+        args.country,
+        args.port,
+        args.iptype,
+        selection_mode=args.selection_mode,
+        benchmark_interval=args.benchmark_interval,
+        sticky_min_score=args.sticky_min_score,
+        sticky_max_latency=args.sticky_max_latency,
+    )
     write_env_file(path, values)
     InstanceConfig.load(instance_id).ensure_dirs()
     print(f"created instance {instance_id}: 127.0.0.1:{args.port} country={args.country}")
@@ -941,13 +979,44 @@ def write_best_node(cfg: InstanceConfig, node: dict[str, Any], result: dict[str,
     write_json(cfg.best_node_file, best_data)
 
 
-def optimize_one(cfg: InstanceConfig, *, download_test: bool = False, restart: bool = True) -> dict[str, Any]:
-    results = benchmark_instance(cfg, download_test=download_test)
+def current_sticky_result(cfg: InstanceConfig, results: list[dict[str, Any]]) -> dict[str, Any] | None:
+    selected = load_json(cfg.selected_node_file, {})
+    if not isinstance(selected, dict):
+        selected = {}
+    current_id = str(selected.get("id") or selected.get("node_id") or "")
+    if not current_id:
+        current_id = str(load_json(cfg.best_node_file, {}).get("node_id") or "")
+    if not current_id:
+        return None
+    for item in results:
+        if str(item.get("node_id") or "") != current_id:
+            continue
+        if not item.get("connect_ok") or not item.get("proxy_ok"):
+            return None
+        if float_value(item.get("final_score"), 0.0) < cfg.sticky_min_final_score:
+            return None
+        if int_value(item.get("proxy_latency_ms"), 999999) > cfg.sticky_max_proxy_latency_ms:
+            return None
+        return item
+    return None
+
+
+def select_result_for_policy(cfg: InstanceConfig, results: list[dict[str, Any]]) -> dict[str, Any]:
     ranked = [r for r in results if r.get("connect_ok") and r.get("proxy_ok")]
     ranked.sort(key=lambda r: float(r.get("final_score") or 0), reverse=True)
     if not ranked:
         raise RuntimeError("benchmark 未找到 connect_ok/proxy_ok 都通过的节点")
-    best_result = ranked[0]
+    mode = cfg.node_selection_mode if cfg.node_selection_mode in {"sticky", "benchmark"} else "sticky"
+    if mode == "sticky":
+        sticky = current_sticky_result(cfg, results)
+        if sticky:
+            return sticky
+    return ranked[0]
+
+
+def optimize_one(cfg: InstanceConfig, *, download_test: bool = False, restart: bool = True) -> dict[str, Any]:
+    results = benchmark_instance(cfg, download_test=download_test)
+    best_result = select_result_for_policy(cfg, results)
     node = fetch_node_config_by_id(cfg, str(best_result.get("node_id")))
     if not node:
         raise RuntimeError(f"无法重新获取最优节点配置: {best_result.get('node_id')}")
@@ -957,6 +1026,7 @@ def optimize_one(cfg: InstanceConfig, *, download_test: bool = False, restart: b
         best_node=node.get("id"),
         best_source="benchmark",
         best_selected_at=iso_now(),
+        node_selection_mode=cfg.node_selection_mode,
         best_final_score=best_result.get("final_score"),
         best_exit_ip=best_result.get("exit_ip"),
         best_proxy_latency_ms=best_result.get("proxy_latency_ms"),
@@ -977,6 +1047,27 @@ def optimize_command(args: argparse.Namespace) -> None:
             summary.append({"instance": iid, "error": str(exc)})
             print(f"[{iid}] optimize failed: {exc}", file=sys.stderr)
     print(json.dumps(summary if args.instance_id == "all" else summary[0], ensure_ascii=False, indent=2))
+
+
+def scheduled_optimize_loop(cfg: InstanceConfig, switch_event: threading.Event, stop_event: threading.Event) -> None:
+    interval = cfg.benchmark_interval_seconds
+    if interval <= 0:
+        return
+    log(cfg, f"Scheduled benchmark enabled: interval={interval}s mode={cfg.node_selection_mode}")
+    while not stop_event.wait(interval):
+        try:
+            before = load_json(cfg.selected_node_file, {})
+            before_id = str(before.get("id") or before.get("node_id") or "") if isinstance(before, dict) else ""
+            result = optimize_one(cfg, download_test=False, restart=False)
+            after_id = str(result.get("best") or "")
+            log(cfg, f"Scheduled benchmark complete: selected={after_id} previous={before_id or '-'} score={result.get('final_score')}")
+            if after_id and before_id and after_id != before_id:
+                set_state(cfg, scheduled_switch_pending=True, scheduled_switch_to=after_id, scheduled_switch_at=iso_now())
+                switch_event.set()
+                return
+        except Exception as exc:
+            log(cfg, f"Scheduled benchmark failed: {exc}")
+            set_state(cfg, scheduled_benchmark_error=str(exc), scheduled_benchmark_error_at=iso_now())
 
 
 def choose_and_connect(cfg: InstanceConfig) -> tuple[dict[str, Any], subprocess.Popen[str]]:
@@ -1045,11 +1136,19 @@ def run_instance(args: argparse.Namespace) -> None:
     check_runtime_requirements()
     if cfg.proxy_bind_host != "127.0.0.1":
         log(cfg, f"WARNING: proxy_bind_host={cfg.proxy_bind_host}; 请使用防火墙限制访问")
-    set_state(cfg, status="starting", instance_id=cfg.instance_id, proxy=f"{cfg.proxy_bind_host}:{cfg.proxy_port}")
+    set_state(
+        cfg,
+        status="starting",
+        instance_id=cfg.instance_id,
+        proxy=f"{cfg.proxy_bind_host}:{cfg.proxy_port}",
+        scheduled_switch_pending=False,
+        scheduled_switch_to="",
+    )
     openvpn_proc: subprocess.Popen[str] | None = None
     proxy_proc: subprocess.Popen[str] | None = None
     forwarder: PortForwarder | None = None
     stop_event = threading.Event()
+    switch_event = threading.Event()
 
     def handle_signal(signum: int, frame: Any) -> None:
         stop_event.set()
@@ -1062,6 +1161,7 @@ def run_instance(args: argparse.Namespace) -> None:
         proxy_proc = start_proxy_in_namespace(cfg)
         forwarder = PortForwarder(cfg)
         forwarder.start()
+        threading.Thread(target=scheduled_optimize_loop, args=(cfg, switch_event, stop_event), daemon=True).start()
         time.sleep(1)
         exit_ip = ""
         try:
@@ -1083,6 +1183,8 @@ def run_instance(args: argparse.Namespace) -> None:
             proxy=f"{cfg.proxy_bind_host}:{cfg.proxy_port}",
         )
         while not stop_event.is_set():
+            if switch_event.is_set():
+                raise RuntimeError("定时测速选择了新的最优节点，触发实例重启以切换出口")
             if openvpn_proc.poll() is not None:
                 raise RuntimeError("OpenVPN 进程已退出")
             if proxy_proc.poll() is not None:
@@ -1171,6 +1273,7 @@ def status_instance(args: argparse.Namespace) -> None:
         print(f"  service: {'active' if service_is_active(iid) else 'inactive'}")
         print(f"  proxy: socks/http {cfg.proxy_bind_host}:{cfg.proxy_port}")
         print(f"  country_filter: {cfg.country_filter or 'all'}")
+        print(f"  selection_policy: mode={cfg.node_selection_mode} interval={cfg.benchmark_interval_seconds}s sticky_min_score={cfg.sticky_min_final_score} sticky_max_latency={cfg.sticky_max_proxy_latency_ms}ms")
         print(f"  namespace: {cfg.namespace} dev={cfg.openvpn_dev_name}")
         print(f"  status: {state.get('status', '-')}")
         print(f"  exit_ip: {state.get('exit_ip', '-')}")
@@ -1183,6 +1286,10 @@ def status_instance(args: argparse.Namespace) -> None:
         print(f"  benchmark_final_score: {selected_benchmark.get('final_score', state.get('best_final_score', '-'))}")
         print(f"  benchmark_proxy_latency_ms: {selected_benchmark.get('proxy_latency_ms', state.get('best_proxy_latency_ms', '-'))}")
         print(f"  benchmark_exit_ip: {selected_benchmark.get('exit_ip', state.get('best_exit_ip', '-'))}")
+        if state.get("scheduled_switch_pending"):
+            print(f"  scheduled_switch_pending: {state.get('scheduled_switch_to', '-')}")
+        if state.get("scheduled_benchmark_error"):
+            print(f"  scheduled_benchmark_error: {state.get('scheduled_benchmark_error')}")
         if state.get("error"):
             print(f"  error: {state['error']}")
 
@@ -1231,6 +1338,36 @@ def config_instance(args: argparse.Namespace) -> None:
     print((INSTANCE_CONFIG_DIR / f"{cfg.instance_id}.env").read_text(encoding="utf-8"))
 
 
+def policy_instance(args: argparse.Namespace) -> None:
+    iid = sanitize_instance_id(args.instance_id)
+    path = INSTANCE_CONFIG_DIR / f"{iid}.env"
+    values = parse_env_file(path)
+    if args.selection_mode:
+        values["NODE_SELECTION_MODE"] = args.selection_mode
+    if args.benchmark_interval is not None:
+        values["BENCHMARK_INTERVAL_SECONDS"] = max(0, args.benchmark_interval)
+    if args.sticky_min_score is not None:
+        values["STICKY_MIN_FINAL_SCORE"] = args.sticky_min_score
+    if args.sticky_max_latency is not None:
+        values["STICKY_MAX_PROXY_LATENCY_MS"] = max(1, args.sticky_max_latency)
+    write_env_file(path, values)
+    cfg = InstanceConfig.load(iid)
+    print(
+        json.dumps(
+            {
+                "instance": iid,
+                "node_selection_mode": cfg.node_selection_mode,
+                "benchmark_interval_seconds": cfg.benchmark_interval_seconds,
+                "sticky_min_final_score": cfg.sticky_min_final_score,
+                "sticky_max_proxy_latency_ms": cfg.sticky_max_proxy_latency_ms,
+                "restart_required": service_is_active(iid),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+
+
 def ports(_: argparse.Namespace) -> None:
     for iid in iter_instances():
         cfg = InstanceConfig.load(iid)
@@ -1262,6 +1399,10 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument("--country", required=True)
     add.add_argument("--port", type=int, required=True)
     add.add_argument("--iptype", default="all")
+    add.add_argument("--selection-mode", choices=["sticky", "benchmark"], default="sticky")
+    add.add_argument("--benchmark-interval", type=int, default=0, help="scheduled benchmark interval in seconds; 0 disables it")
+    add.add_argument("--sticky-min-score", type=float, default=30.0)
+    add.add_argument("--sticky-max-latency", type=int, default=3000)
     add.add_argument("--force", action="store_true")
     add.set_defaults(func=add_instance)
     sub.add_parser("list").set_defaults(func=list_instances)
@@ -1302,6 +1443,13 @@ def build_parser() -> argparse.ArgumentParser:
     config = sub.add_parser("config")
     config.add_argument("instance_id")
     config.set_defaults(func=config_instance)
+    policy = sub.add_parser("policy")
+    policy.add_argument("instance_id")
+    policy.add_argument("--selection-mode", choices=["sticky", "benchmark"])
+    policy.add_argument("--benchmark-interval", type=int, help="scheduled benchmark interval in seconds; 0 disables it")
+    policy.add_argument("--sticky-min-score", type=float)
+    policy.add_argument("--sticky-max-latency", type=int)
+    policy.set_defaults(func=policy_instance)
     sub.add_parser("ports").set_defaults(func=ports)
     sub.add_parser("xray-snippet").set_defaults(func=xray_snippet)
     run = sub.add_parser("run")
