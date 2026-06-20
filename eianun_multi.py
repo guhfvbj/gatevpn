@@ -142,6 +142,8 @@ class InstanceConfig:
     benchmark_interval_seconds: int
     sticky_min_final_score: float
     sticky_max_proxy_latency_ms: int
+    ip_quality_enabled: bool
+    ipdata_api_key: str
     health_check_url: str
     openvpn_dev_name: str
     runtime_dir: Path
@@ -186,6 +188,8 @@ class InstanceConfig:
             benchmark_interval_seconds=max(0, int_value(env.get("BENCHMARK_INTERVAL_SECONDS"), 0)),
             sticky_min_final_score=float_value(env.get("STICKY_MIN_FINAL_SCORE"), 30.0),
             sticky_max_proxy_latency_ms=max(1, int_value(env.get("STICKY_MAX_PROXY_LATENCY_MS"), 3000)),
+            ip_quality_enabled=bool_value(env.get("IP_QUALITY_ENABLED"), bool(env.get("IPDATA_API_KEY") or os.environ.get("IPDATA_API_KEY"))),
+            ipdata_api_key=env.get("IPDATA_API_KEY") or os.environ.get("IPDATA_API_KEY") or "",
             health_check_url=env.get("HEALTH_CHECK_URL") or "https://api.ipify.org",
             openvpn_dev_name=env.get("OPENVPN_DEV_NAME") or f"tun-vg-{instance_id}",
             runtime_dir=runtime_dir,
@@ -227,6 +231,8 @@ def default_instance_values(
     benchmark_interval: int = 0,
     sticky_min_score: float = 30.0,
     sticky_max_latency: int = 3000,
+    ipdata_api_key: str = "",
+    ip_quality_enabled: str = "true",
 ) -> dict[str, Any]:
     return {
         "INSTANCE_ID": instance_id,
@@ -244,6 +250,8 @@ def default_instance_values(
         "BENCHMARK_INTERVAL_SECONDS": benchmark_interval,
         "STICKY_MIN_FINAL_SCORE": sticky_min_score,
         "STICKY_MAX_PROXY_LATENCY_MS": sticky_max_latency,
+        "IP_QUALITY_ENABLED": ip_quality_enabled,
+        "IPDATA_API_KEY": ipdata_api_key,
         "HEALTH_CHECK_URL": "https://api.ipify.org",
         "OPENVPN_DEV_NAME": f"tun-vg-{instance_id}",
         "RUNTIME_DIR": str(RUN_ROOT / instance_id),
@@ -322,6 +330,8 @@ def add_instance(args: argparse.Namespace) -> None:
         benchmark_interval=args.benchmark_interval,
         sticky_min_score=args.sticky_min_score,
         sticky_max_latency=args.sticky_max_latency,
+        ipdata_api_key=args.ipdata_api_key or "",
+        ip_quality_enabled=args.ip_quality,
     )
     write_env_file(path, values)
     InstanceConfig.load(instance_id).ensure_dirs()
@@ -382,6 +392,90 @@ def benchmark_ranked_results(cfg: InstanceConfig) -> list[dict[str, Any]]:
     return benchmark_results_sorted(cfg, usable_only=True)
 
 
+def nested_value(data: dict[str, Any], path: list[str], default: Any = None) -> Any:
+    current: Any = data
+    for key in path:
+        if not isinstance(current, dict):
+            return default
+        current = current.get(key)
+    return default if current is None else current
+
+
+def ipdata_lookup(cfg: InstanceConfig, ip: str) -> dict[str, Any]:
+    if not cfg.ip_quality_enabled or not cfg.ipdata_api_key or not ip:
+        return {}
+    url = f"https://api.ipdata.co/{urllib.parse.quote(ip)}?api-key={urllib.parse.quote(cfg.ipdata_api_key)}"
+    req = urllib.request.Request(url, headers={"User-Agent": "eianun-vpngate-multi"})
+    with urllib.request.urlopen(req, timeout=12) as resp:
+        return json.loads(resp.read().decode("utf-8", errors="replace"))
+
+
+def score_ip_quality(data: dict[str, Any]) -> tuple[float | None, dict[str, Any]]:
+    if not data:
+        return None, {}
+    threat = data.get("threat") if isinstance(data.get("threat"), dict) else {}
+    asn = data.get("asn") if isinstance(data.get("asn"), dict) else {}
+    scores = threat.get("scores") if isinstance(threat.get("scores"), dict) else {}
+    quality = 100.0
+    reasons: list[str] = []
+
+    penalties = {
+        "is_threat": 45,
+        "is_tor": 35,
+        "is_anonymous": 30,
+        "is_known_attacker": 45,
+        "is_known_abuser": 40,
+        "is_bogon": 80,
+        "is_proxy": 20,
+        "is_vpn": 15,
+    }
+    for field, penalty in penalties.items():
+        if threat.get(field):
+            quality -= penalty
+            reasons.append(field)
+
+    vpn_score = int_value(scores.get("vpn_score"), 0)
+    proxy_score = int_value(scores.get("proxy_score"), 0)
+    threat_score = int_value(scores.get("threat_score"), 0)
+    quality -= min(25, vpn_score * 0.15)
+    quality -= min(25, proxy_score * 0.2)
+    quality -= min(35, threat_score * 0.35)
+
+    asn_type = str(asn.get("type") or "").lower()
+    if asn_type == "isp":
+        quality += 15
+        reasons.append("asn_isp_bonus")
+    elif asn_type in {"business", "edu"}:
+        quality += 8
+        reasons.append(f"asn_{asn_type}_bonus")
+    elif asn_type == "hosting":
+        quality -= 20
+        reasons.append("asn_hosting")
+    elif asn_type == "unknown":
+        quality -= 5
+        reasons.append("asn_unknown")
+
+    quality = round(max(0.0, min(100.0, quality)), 3)
+    summary = {
+        "ip": data.get("ip"),
+        "country_code": data.get("country_code"),
+        "country_name": data.get("country_name"),
+        "asn": asn.get("asn"),
+        "asn_name": asn.get("name"),
+        "asn_type": asn_type or None,
+        "is_threat": threat.get("is_threat"),
+        "is_vpn": threat.get("is_vpn"),
+        "is_proxy": threat.get("is_proxy"),
+        "is_tor": threat.get("is_tor"),
+        "is_anonymous": threat.get("is_anonymous"),
+        "vpn_score": vpn_score,
+        "proxy_score": proxy_score,
+        "threat_score": threat_score,
+        "reasons": reasons,
+    }
+    return quality, summary
+
+
 def compute_final_score(result: dict[str, Any]) -> float:
     if not result.get("connect_ok") or not result.get("proxy_ok"):
         return 0.0
@@ -395,7 +489,11 @@ def compute_final_score(result: dict[str, Any]) -> float:
     ping_part = max(0.0, 100.0 - (vpngate_ping / 5.0))
     connect_part = max(0.0, 100.0 - (connect_ms / 250.0))
     proxy_part = max(0.0, 100.0 - (proxy_latency_ms / 20.0))
-    return round(score_part * 0.15 + speed_part * 0.25 + ping_part * 0.15 + connect_part * 0.2 + proxy_part * 0.25, 3)
+    ip_quality = result.get("ip_quality_score")
+    if ip_quality is None:
+        return round(score_part * 0.15 + speed_part * 0.25 + ping_part * 0.15 + connect_part * 0.2 + proxy_part * 0.25, 3)
+    ip_quality_part = max(0.0, min(100.0, float_value(ip_quality)))
+    return round(ip_quality_part * 0.35 + speed_part * 0.2 + proxy_part * 0.2 + connect_part * 0.1 + ping_part * 0.1 + score_part * 0.05, 3)
 
 
 def set_state(cfg: InstanceConfig, **items: Any) -> None:
@@ -858,6 +956,9 @@ def benchmark_one_node(cfg: InstanceConfig, base_cfg: InstanceConfig, node: dict
         "exit_ip": "",
         "connect_ms": None,
         "proxy_latency_ms": None,
+        "ip_quality_ok": None,
+        "ip_quality_score": None,
+        "ip_quality": {},
         "download_bytes": None,
         "download_ms": None,
         "measured_at": iso_now(),
@@ -885,6 +986,17 @@ def benchmark_one_node(cfg: InstanceConfig, base_cfg: InstanceConfig, node: dict
         result["proxy_ok"] = bool(exit_ip and exit_ip != direct_ip)
         if not result["proxy_ok"]:
             result["error"] = f"出口 IP 未变化: direct={direct_ip or '-'} proxy={exit_ip or '-'}"
+        if result["proxy_ok"] and cfg.ip_quality_enabled:
+            try:
+                quality_data = ipdata_lookup(base_cfg, exit_ip)
+                quality_score, quality_summary = score_ip_quality(quality_data)
+                result["ip_quality_score"] = quality_score
+                result["ip_quality"] = quality_summary
+                result["ip_quality_ok"] = quality_score is not None
+            except Exception as exc:
+                result["ip_quality_ok"] = False
+                result["ip_quality_error"] = str(exc)
+                log(base_cfg, f"ipdata quality check failed {exit_ip}: {exc}")
         if download_test and result["proxy_ok"]:
             dl_started = time.time()
             body = http_get_via_socks5(cfg.proxy_bind_host, cfg.proxy_port, BENCHMARK_DOWNLOAD_URL, timeout=20)
@@ -951,12 +1063,13 @@ def best_command(args: argparse.Namespace) -> None:
     results = benchmark_results_sorted(cfg)
     if not results:
         die(f"{cfg.instance_id}: 没有可用 benchmark 结果，请先运行 en multi benchmark {cfg.instance_id}")
-    print(f"{'RANK':<5} {'NODE_ID':<32} {'EXIT_IP':<16} {'LAT_MS':<8} {'SPEED':<12} {'SCORE':<10} {'FINAL':<10}")
+    print(f"{'RANK':<5} {'NODE_ID':<32} {'EXIT_IP':<16} {'LAT_MS':<8} {'IPQ':<8} {'ASN_TYPE':<10} {'SPEED':<12} {'FINAL':<10}")
     for rank, item in enumerate(results[:10], 1):
+        quality = item.get("ip_quality") if isinstance(item.get("ip_quality"), dict) else {}
         print(
             f"{rank:<5} {str(item.get('node_id','-'))[:31]:<32} {str(item.get('exit_ip','-')):<16} "
-            f"{str(item.get('proxy_latency_ms','-')):<8} {str(item.get('vpngate_speed','-')):<12} "
-            f"{str(item.get('vpngate_score','-')):<10} {str(item.get('final_score','-')):<10}"
+            f"{str(item.get('proxy_latency_ms','-')):<8} {str(item.get('ip_quality_score','-')):<8} "
+            f"{str(quality.get('asn_type','-')):<10} {str(item.get('vpngate_speed','-')):<12} {str(item.get('final_score','-')):<10}"
         )
 
 
@@ -1320,6 +1433,7 @@ def status_instance(args: argparse.Namespace) -> None:
         print(f"  proxy: socks/http {cfg.proxy_bind_host}:{cfg.proxy_port}")
         print(f"  country_filter: {cfg.country_filter or 'all'}")
         print(f"  selection_policy: mode={cfg.node_selection_mode} interval={cfg.benchmark_interval_seconds}s sticky_min_score={cfg.sticky_min_final_score} sticky_max_latency={cfg.sticky_max_proxy_latency_ms}ms")
+        print(f"  ip_quality: enabled={cfg.ip_quality_enabled} ipdata_key={'set' if cfg.ipdata_api_key else 'not_set'}")
         print(f"  namespace: {cfg.namespace} dev={cfg.openvpn_dev_name}")
         print(f"  status: {state.get('status', '-')}")
         print(f"  exit_ip: {state.get('exit_ip', '-')}")
@@ -1330,6 +1444,7 @@ def status_instance(args: argparse.Namespace) -> None:
         print(f"  benchmark_time: {state.get('benchmark_at', '-')}")
         print(f"  benchmark_rank: {selected_rank}")
         print(f"  benchmark_final_score: {selected_benchmark.get('final_score', state.get('best_final_score', '-'))}")
+        print(f"  benchmark_ip_quality_score: {selected_benchmark.get('ip_quality_score', '-')}")
         print(f"  benchmark_proxy_latency_ms: {selected_benchmark.get('proxy_latency_ms', state.get('best_proxy_latency_ms', '-'))}")
         print(f"  benchmark_exit_ip: {selected_benchmark.get('exit_ip', state.get('best_exit_ip', '-'))}")
         if state.get("scheduled_switch_pending"):
@@ -1396,6 +1511,10 @@ def policy_instance(args: argparse.Namespace) -> None:
         values["STICKY_MIN_FINAL_SCORE"] = args.sticky_min_score
     if args.sticky_max_latency is not None:
         values["STICKY_MAX_PROXY_LATENCY_MS"] = max(1, args.sticky_max_latency)
+    if args.ip_quality:
+        values["IP_QUALITY_ENABLED"] = "true" if args.ip_quality == "on" else "false"
+    if args.ipdata_api_key is not None:
+        values["IPDATA_API_KEY"] = args.ipdata_api_key
     write_env_file(path, values)
     cfg = InstanceConfig.load(iid)
     print(
@@ -1406,6 +1525,8 @@ def policy_instance(args: argparse.Namespace) -> None:
                 "benchmark_interval_seconds": cfg.benchmark_interval_seconds,
                 "sticky_min_final_score": cfg.sticky_min_final_score,
                 "sticky_max_proxy_latency_ms": cfg.sticky_max_proxy_latency_ms,
+                "ip_quality_enabled": cfg.ip_quality_enabled,
+                "ipdata_api_key_configured": bool(cfg.ipdata_api_key),
                 "restart_required": service_is_active(iid),
             },
             ensure_ascii=False,
@@ -1449,6 +1570,8 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument("--benchmark-interval", type=int, default=0, help="scheduled benchmark interval in seconds; 0 disables it")
     add.add_argument("--sticky-min-score", type=float, default=30.0)
     add.add_argument("--sticky-max-latency", type=int, default=3000)
+    add.add_argument("--ip-quality", choices=["true", "false"], default="true")
+    add.add_argument("--ipdata-api-key", default="")
     add.add_argument("--force", action="store_true")
     add.set_defaults(func=add_instance)
     sub.add_parser("list").set_defaults(func=list_instances)
@@ -1495,6 +1618,8 @@ def build_parser() -> argparse.ArgumentParser:
     policy.add_argument("--benchmark-interval", type=int, help="scheduled benchmark interval in seconds; 0 disables it")
     policy.add_argument("--sticky-min-score", type=float)
     policy.add_argument("--sticky-max-latency", type=int)
+    policy.add_argument("--ip-quality", choices=["on", "off"])
+    policy.add_argument("--ipdata-api-key")
     policy.set_defaults(func=policy_instance)
     sub.add_parser("ports").set_defaults(func=ports)
     sub.add_parser("xray-snippet").set_defaults(func=xray_snippet)

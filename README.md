@@ -373,6 +373,31 @@ sudo en multi policy jp --selection-mode sticky --benchmark-interval 3600 --stic
 
 如果某个国家实例当前没有任何节点可用，服务不会反复崩溃重启；实例会进入 `waiting_for_nodes` 状态，默认等待 1 小时后重新拉取 VPNGate CSV 并执行测速，然后再尝试启动。若设置了 `--benchmark-interval`，无节点重试也会使用同一个间隔。每次定时测速和无节点重试测速之前都会先重新拉取一次 VPNGate 官方 CSV。
 
+### IP 质量检测
+
+benchmark 可以接入 ipdata 做出口 IP 质量检测。建议把 API key 写入实例配置或通过环境变量 `IPDATA_API_KEY` 提供，不要写进仓库源码。
+
+已有实例配置：
+
+```bash
+sudo en multi policy jp --ip-quality on --ipdata-api-key "你的_ipdata_api_key"
+sudo en multi restart jp
+```
+
+新增实例时配置：
+
+```bash
+sudo en multi add jp --country "JP,日本" --port 7928 --iptype all --ipdata-api-key "你的_ipdata_api_key"
+```
+
+启用后，`benchmark.json` 会额外记录：
+
+- `ip_quality_score`：0-100，越高越好。
+- `ip_quality`：ipdata 返回信息的摘要，包括国家、ASN、ASN 类型、VPN/代理/威胁评分等。
+- `ip_quality_ok` / `ip_quality_error`：质量检测是否成功。
+
+最终 `final_score` 会综合 IP 质量、代理延迟、连接耗时、VPNGate speed/ping/score。存在 IP 质量分时，会优先选择质量更好的出口 IP，同时兼顾延迟和速度。
+
 测速并固定最优节点：
 
 ```bash
