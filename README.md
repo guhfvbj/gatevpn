@@ -360,6 +360,13 @@ sudo en multi restart jp
 
 `--benchmark-interval` 单位是秒，`3600` 表示每 1 小时重新拉取 VPNGate CSV 并完整 benchmark；`0` 表示关闭运行期完整 benchmark。
 
+完整 benchmark 默认最多运行 `1800` 秒，也就是 30 分钟；健康检查默认最多运行 `600` 秒，也就是 10 分钟。默认 benchmark 并发为 `2`，适合 1C1G VPS，避免同时拉起太多 OpenVPN 进程：
+
+```bash
+sudo en multi policy jp --health-check-timeout 600 --benchmark-timeout 1800 --benchmark-workers 2
+sudo en multi restart jp
+```
+
 策略变更写入实例 env 文件，实例正在运行时需要重启后生效。
 
 节点选择模式：
@@ -373,13 +380,13 @@ sudo en multi restart jp
 sudo en multi policy jp --selection-mode sticky --health-check-interval 600 --benchmark-interval 3600 --sticky-min-score 30 --sticky-max-latency 3000
 ```
 
-实例运行中每 10 分钟会先通过当前 SOCKS 出口访问 `http://api.ipify.org`，确认当前节点是否可用。如果当前出口失败，会用临时 namespace 测试上一次 `benchmark.json` 榜单前三名；如果前三名都失败，再从历史成功节点里随机抽 3 个测试。健康检查不会更新 `benchmark.json`，因为这类失败可能只是当前国家实例运行状态异常。测到可用替代节点后，会触发该国家实例重启并切到同国家可用节点。如果这 6 个候选都失败，也会重启该国家实例，让实例按启动逻辑重新建立 namespace、OpenVPN 和代理。
+实例运行中每 10 分钟会先通过当前 SOCKS 出口访问 `http://api.ipify.org`，确认当前节点是否可用。如果当前出口失败，会用临时 namespace 测试上一次 `benchmark.json` 榜单前三名；如果前三名都失败，再从历史成功节点里随机抽 3 个测试。健康检查不会更新 `benchmark.json`，因为这类失败可能只是当前国家实例运行状态异常。测到可用替代节点后，会在当前进程内直接切换到该节点，不重启国家实例。如果这 6 个候选都失败，才重启该国家实例一次，让实例按启动逻辑重新建立 namespace、OpenVPN 和代理。若健康检查周期撞上 1 小时完整 benchmark，健康检查会跳过本轮，等下一个 10 分钟周期再跑，完整 benchmark 优先。
 
 每 1 小时会重新拉取 VPNGate CSV，过滤当前国家，执行完整 benchmark，更新 `benchmark.json`，再按 `sticky` 策略优选：当前常用节点还不错就继续使用，除非节点断联、延迟过高、分数过低或 IP 质量变差。
 
 重启时会优先按上一次 `benchmark.json` 榜单从第一名开始选节点，榜单节点不可用就自动尝试下一名，不会跨国家切换。没有 benchmark 榜单时，才拉取 VPNGate CSV 并按默认排序选择第一节点。
 
-如果某个国家实例当前没有任何节点可用，服务不会反复崩溃重启；实例会进入 `waiting_for_nodes` 状态，默认等待 10 分钟后重新拉取 VPNGate CSV 并执行测速，然后再尝试启动。若设置了 `--health-check-interval`，无节点重试也会使用同一个间隔。每次完整 benchmark 和无节点重试测速之前都会先重新拉取一次 VPNGate 官方 CSV。
+如果重启后某个国家实例仍然没有任何节点可用，服务不会继续反复重启；实例会进入 `waiting_for_nodes` 状态，默认等待 1 小时后重新拉取 VPNGate CSV 并执行完整测速，然后再尝试启动。若设置了 `--benchmark-interval`，无节点重试也会使用同一个间隔。每次完整 benchmark 和无节点重试测速之前都会先重新拉取一次 VPNGate 官方 CSV。
 
 ### IP 质量检测
 
