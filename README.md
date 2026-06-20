@@ -371,6 +371,8 @@ sudo en multi policy jp --selection-mode sticky --benchmark-interval 3600 --stic
 
 实例运行中到达定时测速间隔后，会用临时 namespace 执行 benchmark，不污染宿主机默认路由，也不占用当前实例的 SOCKS5 端口。若策略选出了不同节点，服务会触发该国家实例重启并切到新的 `best.ovpn`；不会跨国家切换。
 
+如果某个国家实例当前没有任何节点可用，服务不会反复崩溃重启；实例会进入 `waiting_for_nodes` 状态，默认等待 1 小时后重新拉取 VPNGate CSV 并执行测速，然后再尝试启动。若设置了 `--benchmark-interval`，无节点重试也会使用同一个间隔。每次定时测速和无节点重试测速之前都会先重新拉取一次 VPNGate 官方 CSV。
+
 测速并固定最优节点：
 
 ```bash

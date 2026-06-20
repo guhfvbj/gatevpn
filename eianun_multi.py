@@ -28,6 +28,7 @@ INSTALL_DIR = Path(os.environ.get("EIANUN_INSTALL_DIR", "/opt/eianun-vpngate"))
 PYTHON_BIN = os.environ.get("PYTHON_BIN", sys.executable or "python3")
 BENCHMARK_IP_URL = "http://api.ipify.org"
 BENCHMARK_DOWNLOAD_URL = "http://speedtest.tele2.net/100KB.zip"
+DEFAULT_NO_NODE_RETRY_SECONDS = 3600
 
 CONFIG_ROOT = Path("/etc/eianun-vpngate")
 INSTANCE_CONFIG_DIR = CONFIG_ROOT / "instances"
@@ -45,6 +46,10 @@ COUNTRY_ALIASES = {
     "TW": {"tw", "taiwan", "台湾"},
     "GB": {"gb", "uk", "united kingdom", "英国"},
 }
+
+
+class NoUsableNodes(RuntimeError):
+    pass
 
 
 def die(message: str, code: int = 1) -> None:
@@ -1070,6 +1075,35 @@ def scheduled_optimize_loop(cfg: InstanceConfig, switch_event: threading.Event, 
             set_state(cfg, scheduled_benchmark_error=str(exc), scheduled_benchmark_error_at=iso_now())
 
 
+def no_node_retry_seconds(cfg: InstanceConfig) -> int:
+    return cfg.benchmark_interval_seconds if cfg.benchmark_interval_seconds > 0 else DEFAULT_NO_NODE_RETRY_SECONDS
+
+
+def wait_before_no_node_retry(cfg: InstanceConfig, stop_event: threading.Event, reason: str) -> bool:
+    retry_seconds = no_node_retry_seconds(cfg)
+    retry_at = time.time() + retry_seconds
+    retry_at_text = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(retry_at))
+    log(cfg, f"No usable node now; waiting {retry_seconds}s before pulling and benchmarking again: {reason}")
+    set_state(
+        cfg,
+        status="waiting_for_nodes",
+        error=reason,
+        no_usable_nodes=True,
+        next_retry_at=retry_at_text,
+        retry_after_seconds=retry_seconds,
+    )
+    return stop_event.wait(retry_seconds)
+
+
+def refresh_benchmark_before_retry(cfg: InstanceConfig) -> None:
+    try:
+        log(cfg, "Retry window reached; pulling VPNGate CSV and benchmarking before reconnect")
+        optimize_one(cfg, download_test=False, restart=False)
+    except Exception as exc:
+        log(cfg, f"Retry benchmark did not find a usable node yet: {exc}")
+        set_state(cfg, retry_benchmark_error=str(exc), retry_benchmark_error_at=iso_now())
+
+
 def choose_and_connect(cfg: InstanceConfig) -> tuple[dict[str, Any], subprocess.Popen[str]]:
     errors: list[str] = []
     best = load_json(cfg.best_node_file, {})
@@ -1114,7 +1148,7 @@ def choose_and_connect(cfg: InstanceConfig) -> tuple[dict[str, Any], subprocess.
     nodes = fetch_vpngate_nodes(cfg)
     log(cfg, f"VPNGate fetched/filtered nodes: {len(nodes)}")
     if not nodes:
-        raise RuntimeError("没有可用 VPNGate 节点")
+        raise NoUsableNodes("没有可用 VPNGate 节点")
     for node in nodes[: max(1, cfg.auto_test_workers * 4)]:
         try:
             log(cfg, f"Trying node {node['id']} {node.get('country_short')} {node.get('remote_host')}:{node.get('remote_port')} score={node.get('score')} ping={node.get('ping')} speed={node.get('speed')}")
@@ -1126,7 +1160,7 @@ def choose_and_connect(cfg: InstanceConfig) -> tuple[dict[str, Any], subprocess.
         except Exception as exc:
             errors.append(f"{node.get('id')}: {exc}")
             log(cfg, f"Node failed: {node.get('id')} {exc}")
-    raise RuntimeError("OpenVPN 连接失败: " + "; ".join(errors[-5:]))
+    raise NoUsableNodes("OpenVPN 连接失败: " + "; ".join(errors[-5:]))
 
 
 def run_instance(args: argparse.Namespace) -> None:
@@ -1156,8 +1190,20 @@ def run_instance(args: argparse.Namespace) -> None:
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
     try:
-        setup_namespace(cfg)
-        node, openvpn_proc = choose_and_connect(cfg)
+        while not stop_event.is_set():
+            try:
+                setup_namespace(cfg)
+                node, openvpn_proc = choose_and_connect(cfg)
+                break
+            except NoUsableNodes as exc:
+                cleanup_namespace(cfg)
+                if wait_before_no_node_retry(cfg, stop_event, str(exc)):
+                    raise SystemExit(0)
+                refresh_benchmark_before_retry(cfg)
+        else:
+            raise SystemExit(0)
+        if openvpn_proc is None:
+            raise SystemExit(0)
         proxy_proc = start_proxy_in_namespace(cfg)
         forwarder = PortForwarder(cfg)
         forwarder.start()
