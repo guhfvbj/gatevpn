@@ -190,11 +190,248 @@ en uninstall   # 卸载
       └─ SSH / Web UI 仍走物理网卡，避免 VPS 失联
 ```
 
+## 多实例模式：VPNGate 多节点管理器
+
+多实例模式面向 Ubuntu + systemd + 3-xui/Xray。它不会替换原来的单实例 `eianun-vpngate.service`，而是新增 systemd template：
+
+```bash
+/etc/systemd/system/eianun-vpngate@.service
+```
+
+每个实例都有独立配置、状态、OpenVPN 进程、日志和本地代理端口：
+
+```text
+/etc/eianun-vpngate/instances/jp.env
+/var/lib/eianun-vpngate/instances/jp/
+/run/eianun-vpngate/jp/
+/var/log/eianun-vpngate/jp.log
+```
+
+### 隔离方案
+
+多实例模式使用 **Linux network namespace + veth + host loopback forwarder**：
+
+```text
+Xray outbound -> 127.0.0.1:7928
+                    │
+                    ▼
+host 本地 TCP forwarder
+                    │ veth
+                    ▼
+netns vg-jp 内的 HTTP/SOCKS5 proxy
+                    │ SO_BINDTODEVICE=tun-vg-jp
+                    ▼
+netns vg-jp 内的 OpenVPN / VPNGate 出口
+```
+
+OpenVPN 生成配置会强制移除或覆盖高风险路由指令，并追加：
+
+```text
+route-nopull
+pull-filter ignore redirect-gateway
+pull-filter ignore dhcp-option
+pull-filter ignore route
+pull-filter ignore route-ipv6
+dev tun-vg-<instance_id>
+dev-type tun
+```
+
+OpenVPN 运行在对应 namespace 内，宿主机会为该 namespace 的 veth 地址添加一条 MASQUERADE 规则，让 OpenVPN 在隧道建立前能访问 VPNGate 服务器。宿主机默认路由不会被 OpenVPN 修改。namespace 内连接成功后，程序只在该 namespace 内把默认路由指向对应 TUN，并保留 VPNGate 服务器的 `/32` 控制连接路由；SSH、3-xui 面板和已有 Xray 入站仍走宿主机原路由。
+
+当前多实例模式只使用 VPNGate 官方 CSV API：
+
+```text
+https://www.vpngate.net/api/iphone/
+```
+
+不会使用 HTML 爬虫，也不会拉取 VPNBook/IPSpeed。
+
+### 安装或升级
+
+普通安装保持不变：
+
+```bash
+sudo sh install.sh
+```
+
+安装时同时初始化多实例目录：
+
+```bash
+sudo sh install.sh --multi
+```
+
+已安装后也可以执行：
+
+```bash
+sudo en multi init
+```
+
+### 添加 JP/KR/US 实例
+
+```bash
+sudo en multi add jp --country "JP,日本" --port 7928 --iptype all
+sudo en multi add kr --country "KR,韩国" --port 7929 --iptype all
+sudo en multi add us --country "US,美国" --port 7930 --iptype all
+```
+
+启动、停止和重启：
+
+```bash
+sudo en multi start jp
+sudo en multi start kr
+sudo en multi start us
+
+sudo en multi restart jp
+sudo en multi stop jp
+```
+
+等价 systemd 命令：
+
+```bash
+sudo systemctl start eianun-vpngate@jp
+sudo systemctl status eianun-vpngate@jp
+```
+
+### 查看状态和日志
+
+```bash
+sudo en multi list
+sudo en multi status
+sudo en multi status jp
+sudo en multi logs jp
+sudo en multi ports
+```
+
+手动切换节点会重启该实例，重新拉取并选择候选节点：
+
+```bash
+sudo en multi switch jp
+```
+
+### 测试出口 IP
+
+```bash
+sudo en multi test jp
+sudo en multi test kr
+sudo en multi test us
+
+curl -x socks5h://127.0.0.1:7928 https://api.ipify.org
+curl -x socks5h://127.0.0.1:7929 https://api.ipify.org
+curl -x socks5h://127.0.0.1:7930 https://api.ipify.org
+```
+
+预期返回的是 VPNGate 出口 IP，不应是 VPS 原始公网 IP。VPNGate 免费节点质量不稳定，三个实例“尽量不同”，但不能保证每次都来自不同公网段。
+
+### 接入 3-xui / Xray
+
+生成 Xray 示例：
+
+```bash
+sudo en multi xray-snippet
+```
+
+输出会包含 `outbounds` 和 `routing_rules_example`，例如：
+
+```json
+{
+  "outbounds": [
+    {
+      "tag": "vpngate-jp-out",
+      "protocol": "socks",
+      "settings": {
+        "servers": [
+          {
+            "address": "127.0.0.1",
+            "port": 7928
+          }
+        ]
+      }
+    }
+  ],
+  "routing_rules_example": [
+    {
+      "type": "field",
+      "inboundTag": [
+        "vless-vpngate-jp"
+      ],
+      "outboundTag": "vpngate-jp-out"
+    }
+  ]
+}
+```
+
+在 3-xui/Xray 中创建或编辑对应 VLESS inbound，确保 inboundTag 与规则中的 `vless-vpngate-jp`、`vless-vpngate-kr`、`vless-vpngate-us` 对应。
+
+### 从单实例 7928 迁移
+
+如果原单实例正在占用 `127.0.0.1:7928`，先停止单实例：
+
+```bash
+sudo en stop
+```
+
+然后创建多实例中的 `jp` 使用 7928：
+
+```bash
+sudo en multi init
+sudo en multi add jp --country "JP,日本" --port 7928 --iptype all
+sudo en multi start jp
+```
+
+如果仍要保留旧单实例，请给多实例使用其他端口，例如 7929、7930、7931。
+
+### 卸载和清理
+
+删除单个实例：
+
+```bash
+sudo en multi stop jp
+sudo en multi delete jp
+```
+
+清理全部多实例：
+
+```bash
+sudo systemctl stop 'eianun-vpngate@*.service'
+sudo rm -f /etc/systemd/system/eianun-vpngate@.service
+sudo rm -rf /etc/eianun-vpngate /var/lib/eianun-vpngate /run/eianun-vpngate /var/log/eianun-vpngate
+sudo systemctl daemon-reload
+```
+
+完整卸载原项目仍使用：
+
+```bash
+sudo en uninstall
+```
+
+### 故障排查
+
+```bash
+ls -l /dev/net/tun
+command -v openvpn
+ip netns list
+ip addr show
+sudo journalctl -u eianun-vpngate@jp -f
+sudo tail -f /var/log/eianun-vpngate/jp.log
+sudo en multi ports
+sudo en multi status jp
+```
+
+常见问题：
+
+- `/dev/net/tun` 不存在：VPS 内核或容器未开启 TUN。
+- OpenVPN 未安装：重新运行安装脚本或手动 `apt install openvpn`。
+- 端口冲突：换端口或停止占用 7928/7929/7930 的旧服务。
+- 没有可用节点：VPNGate 对应国家节点临时不可用，换国家或稍后重试。
+- 出口 IP 检测失败：节点已连上但免费出口质量差，可执行 `en multi switch <id>`。
+- 代理绑定非 `127.0.0.1`：必须用防火墙限制访问，避免开放代理暴露到公网。
+
 ## 文件说明
 
 - `vpngate_manager.py`：主程序、Web UI、节点拉取/检测/连接逻辑。
 - `vpn_utils.py`：IP 信息、延迟检测、OpenVPN 配置解析等工具函数。
 - `proxy_server.py`：本地 HTTP/SOCKS5 代理服务。
+- `eianun_multi.py`：VPNGate 多实例 CLI、systemd template 运行入口和 namespace 隔离逻辑。
 - `install.sh`：一键安装和 CLI 工具生成脚本。
 - `LICENSE`：原始许可证文件。
 

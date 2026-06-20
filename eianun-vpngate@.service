@@ -1,0 +1,17 @@
+[Unit]
+Description=Eianun VPNGate multi instance %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/eianun-vpngate/instances/%i.env
+WorkingDirectory=/opt/eianun-vpngate
+ExecStart=/usr/bin/python3 /opt/eianun-vpngate/eianun_multi.py run %i
+Restart=always
+RestartSec=8
+KillSignal=SIGTERM
+TimeoutStopSec=25
+
+[Install]
+WantedBy=multi-user.target

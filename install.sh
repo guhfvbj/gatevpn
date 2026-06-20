@@ -160,6 +160,12 @@ check_required_tools() {
     say "  -> Python: ${GREEN}${PYTHON_BIN}${PLAIN}"
 }
 
+MULTI_INSTALL=0
+if [ "${1:-}" = "--multi" ]; then
+    MULTI_INSTALL=1
+    shift
+fi
+
 DEFAULT_USER="illria"
 DEFAULT_REPO="gatevpn"
 GITHUB_USER="${1:-$DEFAULT_USER}"
@@ -275,6 +281,31 @@ EOF_SERVICE
 }
 
 configure_service
+chmod +x "${INSTALL_DIR}/eianun_multi.py" "${INSTALL_DIR}/proxy_server.py" 2>/dev/null || true
+if [ "$(detect_service_manager)" = "systemd" ]; then
+    say "  -> 正在创建 systemd 多实例模板: /etc/systemd/system/eianun-vpngate@.service"
+    mkdir -p /etc/eianun-vpngate/instances /var/lib/eianun-vpngate/instances /var/log/eianun-vpngate /run/eianun-vpngate
+    cat > /etc/systemd/system/eianun-vpngate@.service <<EOF_SERVICE
+[Unit]
+Description=Eianun VPNGate multi instance %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/eianun-vpngate/instances/%i.env
+WorkingDirectory=${INSTALL_DIR}
+ExecStart=${PYTHON_BIN} ${INSTALL_DIR}/eianun_multi.py run %i
+Restart=always
+RestartSec=8
+KillSignal=SIGTERM
+TimeoutStopSec=25
+
+[Install]
+WantedBy=multi-user.target
+EOF_SERVICE
+    systemctl daemon-reload || true
+fi
 
 say "\n${YELLOW}[4/4] 正在创建全局命令快捷接口 'en'...${PLAIN}"
 say "  -> 正在写入管理脚本 /usr/bin/en ..."
@@ -989,7 +1020,13 @@ def main():
         
     if len(sys.argv) > 1:
         cmd = sys.argv[1].lower()
-        if cmd == "start":
+        if cmd == "multi":
+            script = os.path.join(INSTALL_DIR, "eianun_multi.py")
+            if not os.path.exists(script):
+                print(f"错误: 多实例脚本不存在: {script}")
+                sys.exit(1)
+            os.execv(sys.executable, [sys.executable, script] + sys.argv[2:])
+        elif cmd == "start":
             start_service()
         elif cmd == "stop":
             stop_service()
@@ -1033,7 +1070,7 @@ def main():
         elif cmd in ("iptype", "ip-type", "type"):
             configure_iptype()
         else:
-            print("未知命令。可用命令: start, stop, restart, status, logs, update, uninstall, web, port, password, source, country, iptype")
+            print("未知命令。可用命令: start, stop, restart, status, logs, update, uninstall, web, port, password, source, country, iptype, multi")
         sys.exit(0)
         
     options = {
@@ -1047,6 +1084,7 @@ def main():
         '8': ("节点来源 (en source)", configure_source),
         '9': ("地区过滤 (en country)", configure_country),
         'a': ("自动IP类型 (en iptype)", configure_iptype),
+        'm': ("多实例管理 (en multi list)", lambda: subprocess.run([sys.executable, os.path.join(INSTALL_DIR, "eianun_multi.py"), "list"])),
         'u': ("一键更新 (en update)", update_service),
         'x': ("完全卸载 (en uninstall)", uninstall_service),
         '0': ("退出终端", None)

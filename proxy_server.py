@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 import select
+import os
 import socket
+import sys
 import threading
 import urllib.parse
 import time
 from typing import Any
+
+DEFAULT_BIND_DEVICE = os.environ.get("PROXY_BIND_DEVICE", "tun0").strip() or "tun0"
 
 def parse_int(value: Any) -> int:
     try:
@@ -22,7 +26,17 @@ def recv_exact(sock: socket.socket, size: int) -> bytes:
         data += chunk
     return data
 
-def resolve_dns_over_tun0(host: str, dns_server: str = "8.8.8.8", timeout: float = 3.0) -> str | None:
+def bind_socket_to_device(sock: socket.socket, device: str | None = None) -> bool:
+    bind_device = (device or DEFAULT_BIND_DEVICE).strip()
+    if not bind_device:
+        return True
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, bind_device.encode("utf-8"))
+        return True
+    except OSError:
+        return False
+
+def resolve_dns_over_tun(host: str, dns_server: str = "8.8.8.8", timeout: float = 3.0, device: str | None = None) -> str | None:
     try:
         socket.inet_aton(host)
         return host
@@ -49,9 +63,7 @@ def resolve_dns_over_tun0(host: str, dns_server: str = "8.8.8.8", timeout: float
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.settimeout(timeout)
-        try:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, b"tun0")
-        except OSError:
+        if not bind_socket_to_device(sock, device):
             return None
         sock.sendto(packet, (dns_server, 53))
         resp, _ = sock.recvfrom(2048)
@@ -115,7 +127,7 @@ def resolve_dns_over_tun0(host: str, dns_server: str = "8.8.8.8", timeout: float
 
 def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.socket:
     host, port = address
-    resolved_ip = resolve_dns_over_tun0(host)
+    resolved_ip = resolve_dns_over_tun(host)
     if resolved_ip:
         host = resolved_ip
 
@@ -126,7 +138,8 @@ def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.s
         try:
             sock = socket.socket(af, socktype, proto)
             sock.settimeout(timeout)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, b"tun0")
+            if not bind_socket_to_device(sock):
+                raise OSError(f"failed to bind socket to device {DEFAULT_BIND_DEVICE}")
             sock.connect(sa)
             return sock
         except OSError as e:
@@ -265,3 +278,8 @@ def start_proxy_server(host: str, port: int) -> None:
         except Exception as e:
             print(f"[ERROR] Proxy accept failed: {e}", flush=True)
             time.sleep(0.5)
+
+if __name__ == "__main__":
+    listen_host = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("LOCAL_PROXY_HOST", "127.0.0.1")
+    listen_port = parse_int(sys.argv[2] if len(sys.argv) > 2 else os.environ.get("LOCAL_PROXY_PORT", "7928")) or 7928
+    start_proxy_server(listen_host, listen_port)
