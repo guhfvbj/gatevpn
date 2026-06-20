@@ -398,6 +398,32 @@ sudo en multi add jp --country "JP,日本" --port 7928 --iptype all --ipdata-api
 
 最终 `final_score` 会综合 IP 质量、代理延迟、连接耗时、VPNGate speed/ping/score。存在 IP 质量分时，会优先选择质量更好的出口 IP，同时兼顾延迟和速度。
 
+### 日志和榜单保留
+
+多实例默认开启保留策略，最多保存最近 7 天的实例日志和榜单文件。清理范围包括：
+
+- `/var/log/eianun-vpngate/<instance_id>.log`
+- `/var/lib/eianun-vpngate/instances/<instance_id>/benchmark.json`
+- `/var/lib/eianun-vpngate/instances/<instance_id>/best_node.json`
+- `/var/lib/eianun-vpngate/instances/<instance_id>/best.ovpn`
+- `/var/lib/eianun-vpngate/instances/<instance_id>/nodes.json`
+
+调整保留天数：
+
+```bash
+sudo en multi policy jp --retention on --retention-days 7
+sudo en multi restart jp
+```
+
+关闭自动清理：
+
+```bash
+sudo en multi policy jp --retention off
+sudo en multi restart jp
+```
+
+过期榜单会被删除，实例下次启动时不会继续使用旧 `benchmark.json`，而是按当前逻辑重新拉取 VPNGate CSV 或等待下一轮测速。
+
 测速并固定最优节点：
 
 ```bash

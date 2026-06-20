@@ -145,6 +145,8 @@ class InstanceConfig:
     sticky_max_proxy_latency_ms: int
     ip_quality_enabled: bool
     ipdata_api_key: str
+    retention_enabled: bool
+    retention_days: int
     health_check_url: str
     openvpn_dev_name: str
     runtime_dir: Path
@@ -191,6 +193,8 @@ class InstanceConfig:
             sticky_max_proxy_latency_ms=max(1, int_value(env.get("STICKY_MAX_PROXY_LATENCY_MS"), 3000)),
             ip_quality_enabled=bool_value(env.get("IP_QUALITY_ENABLED"), bool(env.get("IPDATA_API_KEY") or os.environ.get("IPDATA_API_KEY"))),
             ipdata_api_key=env.get("IPDATA_API_KEY") or os.environ.get("IPDATA_API_KEY") or "",
+            retention_enabled=bool_value(env.get("RETENTION_ENABLED"), True),
+            retention_days=max(1, int_value(env.get("RETENTION_DAYS"), 7)),
             health_check_url=env.get("HEALTH_CHECK_URL") or "https://api.ipify.org",
             openvpn_dev_name=env.get("OPENVPN_DEV_NAME") or f"tun-vg-{instance_id}",
             runtime_dir=runtime_dir,
@@ -234,6 +238,8 @@ def default_instance_values(
     sticky_max_latency: int = 3000,
     ipdata_api_key: str = "",
     ip_quality_enabled: str = "true",
+    retention_enabled: str = "true",
+    retention_days: int = 7,
 ) -> dict[str, Any]:
     return {
         "INSTANCE_ID": instance_id,
@@ -253,6 +259,8 @@ def default_instance_values(
         "STICKY_MAX_PROXY_LATENCY_MS": sticky_max_latency,
         "IP_QUALITY_ENABLED": ip_quality_enabled,
         "IPDATA_API_KEY": ipdata_api_key,
+        "RETENTION_ENABLED": retention_enabled,
+        "RETENTION_DAYS": retention_days,
         "HEALTH_CHECK_URL": "https://api.ipify.org",
         "OPENVPN_DEV_NAME": f"tun-vg-{instance_id}",
         "RUNTIME_DIR": str(RUN_ROOT / instance_id),
@@ -333,6 +341,8 @@ def add_instance(args: argparse.Namespace) -> None:
         sticky_max_latency=args.sticky_max_latency,
         ipdata_api_key=args.ipdata_api_key or "",
         ip_quality_enabled=args.ip_quality,
+        retention_enabled=args.retention,
+        retention_days=args.retention_days,
     )
     write_env_file(path, values)
     InstanceConfig.load(instance_id).ensure_dirs()
@@ -502,6 +512,47 @@ def set_state(cfg: InstanceConfig, **items: Any) -> None:
     state.update(items)
     state["updated_at"] = time.time()
     write_json(cfg.state_file, state)
+
+
+def retention_cutoff(cfg: InstanceConfig) -> float:
+    return time.time() - (max(1, cfg.retention_days) * 86400)
+
+
+def prune_log_file(cfg: InstanceConfig) -> None:
+    if not cfg.log_file.exists():
+        return
+    cutoff = retention_cutoff(cfg)
+    kept: list[str] = []
+    changed = False
+    for line in cfg.log_file.read_text(encoding="utf-8", errors="replace").splitlines():
+        timestamp = line[:19]
+        try:
+            line_time = time.mktime(time.strptime(timestamp, "%Y-%m-%d %H:%M:%S"))
+            if line_time < cutoff:
+                changed = True
+                continue
+        except Exception:
+            pass
+        kept.append(line)
+    if changed:
+        cfg.log_file.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+
+
+def prune_stale_rank_files(cfg: InstanceConfig) -> None:
+    cutoff = retention_cutoff(cfg)
+    for path in [cfg.benchmark_file, cfg.best_node_file, cfg.best_ovpn_file, cfg.nodes_file]:
+        try:
+            if path.exists() and path.stat().st_mtime < cutoff:
+                path.unlink()
+        except OSError:
+            pass
+
+
+def apply_retention(cfg: InstanceConfig) -> None:
+    if not cfg.retention_enabled:
+        return
+    prune_log_file(cfg)
+    prune_stale_rank_files(cfg)
 
 
 def log(cfg: InstanceConfig, message: str) -> None:
@@ -1022,6 +1073,7 @@ def benchmark_one_node(cfg: InstanceConfig, base_cfg: InstanceConfig, node: dict
 
 def benchmark_instance(cfg: InstanceConfig, *, download_test: bool = False) -> list[dict[str, Any]]:
     cfg.ensure_dirs()
+    apply_retention(cfg)
     check_runtime_requirements()
     direct_ip = ""
     try:
@@ -1300,6 +1352,7 @@ def connect_with_wait(cfg: InstanceConfig, failed_node_ids: set[str], stop_event
 def run_instance(args: argparse.Namespace) -> None:
     cfg = InstanceConfig.load(args.instance_id)
     cfg.ensure_dirs()
+    apply_retention(cfg)
     cfg.pid_file.write_text(str(os.getpid()), encoding="utf-8")
     check_runtime_requirements()
     if cfg.proxy_bind_host != "127.0.0.1":
@@ -1462,6 +1515,7 @@ def status_instance(args: argparse.Namespace) -> None:
     ids = [args.instance_id] if args.instance_id else iter_instances()
     for iid in ids:
         cfg = InstanceConfig.load(iid)
+        apply_retention(cfg)
         state = load_json(cfg.state_file, {})
         selected = load_json(cfg.selected_node_file, {})
         if not isinstance(selected, dict):
@@ -1483,6 +1537,7 @@ def status_instance(args: argparse.Namespace) -> None:
         print(f"  country_filter: {cfg.country_filter or 'all'}")
         print(f"  selection_policy: mode={cfg.node_selection_mode} interval={cfg.benchmark_interval_seconds}s sticky_min_score={cfg.sticky_min_final_score} sticky_max_latency={cfg.sticky_max_proxy_latency_ms}ms")
         print(f"  ip_quality: enabled={cfg.ip_quality_enabled} ipdata_key={'set' if cfg.ipdata_api_key else 'not_set'}")
+        print(f"  retention: enabled={cfg.retention_enabled} days={cfg.retention_days}")
         print(f"  namespace: {cfg.namespace} dev={cfg.openvpn_dev_name}")
         print(f"  status: {state.get('status', '-')}")
         print(f"  exit_ip: {state.get('exit_ip', '-')}")
@@ -1506,6 +1561,7 @@ def status_instance(args: argparse.Namespace) -> None:
 
 def logs_instance(args: argparse.Namespace) -> None:
     cfg = InstanceConfig.load(args.instance_id)
+    apply_retention(cfg)
     if args.follow:
         subprocess.run(["tail", "-n", str(args.lines), "-f", str(cfg.log_file)])
     else:
@@ -1564,6 +1620,10 @@ def policy_instance(args: argparse.Namespace) -> None:
         values["IP_QUALITY_ENABLED"] = "true" if args.ip_quality == "on" else "false"
     if args.ipdata_api_key is not None:
         values["IPDATA_API_KEY"] = args.ipdata_api_key
+    if args.retention:
+        values["RETENTION_ENABLED"] = "true" if args.retention == "on" else "false"
+    if args.retention_days is not None:
+        values["RETENTION_DAYS"] = max(1, args.retention_days)
     write_env_file(path, values)
     cfg = InstanceConfig.load(iid)
     print(
@@ -1576,6 +1636,8 @@ def policy_instance(args: argparse.Namespace) -> None:
                 "sticky_max_proxy_latency_ms": cfg.sticky_max_proxy_latency_ms,
                 "ip_quality_enabled": cfg.ip_quality_enabled,
                 "ipdata_api_key_configured": bool(cfg.ipdata_api_key),
+                "retention_enabled": cfg.retention_enabled,
+                "retention_days": cfg.retention_days,
                 "restart_required": service_is_active(iid),
             },
             ensure_ascii=False,
@@ -1621,6 +1683,8 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument("--sticky-max-latency", type=int, default=3000)
     add.add_argument("--ip-quality", choices=["true", "false"], default="true")
     add.add_argument("--ipdata-api-key", default="")
+    add.add_argument("--retention", choices=["true", "false"], default="true")
+    add.add_argument("--retention-days", type=int, default=7)
     add.add_argument("--force", action="store_true")
     add.set_defaults(func=add_instance)
     sub.add_parser("list").set_defaults(func=list_instances)
@@ -1669,6 +1733,8 @@ def build_parser() -> argparse.ArgumentParser:
     policy.add_argument("--sticky-max-latency", type=int)
     policy.add_argument("--ip-quality", choices=["on", "off"])
     policy.add_argument("--ipdata-api-key")
+    policy.add_argument("--retention", choices=["on", "off"])
+    policy.add_argument("--retention-days", type=int)
     policy.set_defaults(func=policy_instance)
     sub.add_parser("ports").set_defaults(func=ports)
     sub.add_parser("xray-snippet").set_defaults(func=xray_snippet)
