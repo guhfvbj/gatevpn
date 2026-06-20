@@ -166,7 +166,7 @@ if [ "${1:-}" = "--multi" ]; then
     shift
 fi
 
-DEFAULT_USER="illria"
+DEFAULT_USER="guhfvbj"
 DEFAULT_REPO="gatevpn"
 GITHUB_USER="${1:-$DEFAULT_USER}"
 GITHUB_REPO="${2:-$DEFAULT_REPO}"

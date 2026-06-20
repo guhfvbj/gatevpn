@@ -31,12 +31,12 @@
 
 ## 快速安装
 
-你的仓库地址是：`https://github.com/illria/gatevpn`
+你的仓库地址是：`https://github.com/guhfvbj/gatevpn`
 
 上传文件到该仓库后，使用下面命令安装：
 
 ```bash
-curl -Ls https://raw.githubusercontent.com/illria/gatevpn/main/install.sh -o install.sh
+curl -Ls https://raw.githubusercontent.com/guhfvbj/gatevpn/main/install.sh -o install.sh
 sudo sh install.sh
 ```
 
@@ -45,7 +45,7 @@ Alpine Linux 也可以直接使用上面的 `sh` 命令；脚本会通过 `apk` 
 也可以在安装时指定仓库用户和仓库名：
 
 ```bash
-sh install.sh illria gatevpn
+sh install.sh guhfvbj gatevpn
 ```
 
 ## 安装脚本依赖检测
