@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import random
 import select
 import shlex
 import signal
@@ -28,7 +29,8 @@ INSTALL_DIR = Path(os.environ.get("EIANUN_INSTALL_DIR", "/opt/eianun-vpngate"))
 PYTHON_BIN = os.environ.get("PYTHON_BIN", sys.executable or "python3")
 BENCHMARK_IP_URL = "http://api.ipify.org"
 BENCHMARK_DOWNLOAD_URL = "http://speedtest.tele2.net/100KB.zip"
-DEFAULT_BENCHMARK_INTERVAL_SECONDS = 600
+DEFAULT_HEALTH_CHECK_INTERVAL_SECONDS = 600
+DEFAULT_BENCHMARK_INTERVAL_SECONDS = 3600
 DEFAULT_NO_NODE_RETRY_SECONDS = 600
 
 CONFIG_ROOT = Path("/etc/eianun-vpngate")
@@ -50,6 +52,10 @@ COUNTRY_ALIASES = {
 
 
 class NoUsableNodes(RuntimeError):
+    pass
+
+
+class RestartRequested(RuntimeError):
     pass
 
 
@@ -140,6 +146,7 @@ class InstanceConfig:
     auto_select_best_node: bool
     allow_active_switch: bool
     node_selection_mode: str
+    health_check_interval_seconds: int
     benchmark_interval_seconds: int
     sticky_min_final_score: float
     sticky_max_proxy_latency_ms: int
@@ -159,6 +166,7 @@ class InstanceConfig:
     benchmark_file: Path
     best_node_file: Path
     best_ovpn_file: Path
+    benchmark_ovpn_dir: Path
     namespace: str
     host_veth: str
     ns_veth: str
@@ -188,6 +196,7 @@ class InstanceConfig:
             auto_select_best_node=bool_value(env.get("AUTO_SELECT_BEST_NODE"), True),
             allow_active_switch=bool_value(env.get("ALLOW_ACTIVE_SWITCH"), True),
             node_selection_mode=(env.get("NODE_SELECTION_MODE") or "sticky").strip().lower(),
+            health_check_interval_seconds=max(0, int_value(env.get("HEALTH_CHECK_INTERVAL_SECONDS"), DEFAULT_HEALTH_CHECK_INTERVAL_SECONDS)),
             benchmark_interval_seconds=max(0, int_value(env.get("BENCHMARK_INTERVAL_SECONDS"), DEFAULT_BENCHMARK_INTERVAL_SECONDS)),
             sticky_min_final_score=float_value(env.get("STICKY_MIN_FINAL_SCORE"), 30.0),
             sticky_max_proxy_latency_ms=max(1, int_value(env.get("STICKY_MAX_PROXY_LATENCY_MS"), 3000)),
@@ -207,6 +216,7 @@ class InstanceConfig:
             benchmark_file=state_dir / "benchmark.json",
             best_node_file=state_dir / "best_node.json",
             best_ovpn_file=state_dir / "best.ovpn",
+            benchmark_ovpn_dir=state_dir / "benchmark_ovpns",
             namespace=f"vg-{instance_id}",
             host_veth=f"vg{instance_id[:8]}h"[:15],
             ns_veth=f"vg{instance_id[:8]}n"[:15],
@@ -215,7 +225,7 @@ class InstanceConfig:
         )
 
     def ensure_dirs(self) -> None:
-        for path in [self.runtime_dir, self.log_file.parent, self.state_file.parent, self.generated_ovpn_file.parent]:
+        for path in [self.runtime_dir, self.log_file.parent, self.state_file.parent, self.generated_ovpn_file.parent, self.benchmark_ovpn_dir]:
             path.mkdir(parents=True, exist_ok=True)
 
 
@@ -233,6 +243,7 @@ def default_instance_values(
     iptype: str,
     *,
     selection_mode: str = "sticky",
+    health_check_interval: int = DEFAULT_HEALTH_CHECK_INTERVAL_SECONDS,
     benchmark_interval: int = DEFAULT_BENCHMARK_INTERVAL_SECONDS,
     sticky_min_score: float = 30.0,
     sticky_max_latency: int = 3000,
@@ -254,6 +265,7 @@ def default_instance_values(
         "AUTO_SELECT_BEST_NODE": "true",
         "ALLOW_ACTIVE_SWITCH": "true",
         "NODE_SELECTION_MODE": selection_mode,
+        "HEALTH_CHECK_INTERVAL_SECONDS": health_check_interval,
         "BENCHMARK_INTERVAL_SECONDS": benchmark_interval,
         "STICKY_MIN_FINAL_SCORE": sticky_min_score,
         "STICKY_MAX_PROXY_LATENCY_MS": sticky_max_latency,
@@ -336,6 +348,7 @@ def add_instance(args: argparse.Namespace) -> None:
         args.port,
         args.iptype,
         selection_mode=args.selection_mode,
+        health_check_interval=args.health_check_interval,
         benchmark_interval=args.benchmark_interval,
         sticky_min_score=args.sticky_min_score,
         sticky_max_latency=args.sticky_max_latency,
@@ -546,6 +559,13 @@ def prune_stale_rank_files(cfg: InstanceConfig) -> None:
                 path.unlink()
         except OSError:
             pass
+    if cfg.benchmark_ovpn_dir.exists():
+        for path in cfg.benchmark_ovpn_dir.glob("*.ovpn"):
+            try:
+                if path.stat().st_mtime < cutoff:
+                    path.unlink()
+            except OSError:
+                pass
 
 
 def apply_retention(cfg: InstanceConfig) -> None:
@@ -992,6 +1012,19 @@ def benchmark_temp_config(cfg: InstanceConfig) -> InstanceConfig:
     )
 
 
+def benchmark_ovpn_path(cfg: InstanceConfig, node_id: str) -> Path:
+    return cfg.benchmark_ovpn_dir / f"{safe_name(node_id)}.ovpn"
+
+
+def cache_benchmark_ovpn(cfg: InstanceConfig, node: dict[str, Any]) -> None:
+    config_text = str(node.get("config_text") or "")
+    if not config_text:
+        return
+    path = benchmark_ovpn_path(cfg, str(node.get("id") or node.get("node_id") or "node"))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(sanitize_openvpn_config(config_text, cfg), encoding="utf-8")
+
+
 def benchmark_one_node(cfg: InstanceConfig, base_cfg: InstanceConfig, node: dict[str, Any], direct_ip: str, *, download_test: bool = False) -> dict[str, Any]:
     result: dict[str, Any] = {
         "node_id": node.get("id"),
@@ -1071,6 +1104,100 @@ def benchmark_one_node(cfg: InstanceConfig, base_cfg: InstanceConfig, node: dict
     return result
 
 
+def benchmark_cached_result_candidate(cfg: InstanceConfig, item: dict[str, Any], direct_ip: str) -> dict[str, Any]:
+    node_id = str(item.get("node_id") or item.get("id") or "")
+    ovpn_path = benchmark_ovpn_path(cfg, node_id)
+    if not node_id or not ovpn_path.exists():
+        result = dict(item)
+        result.update({"node_id": node_id, "connect_ok": False, "proxy_ok": False, "error": "cached ovpn not found", "measured_at": iso_now(), "final_score": 0.0})
+        return result
+    node = {
+        "id": node_id,
+        "country_short": item.get("country_short"),
+        "country": item.get("country"),
+        "remote_host": item.get("remote_host"),
+        "remote_port": item.get("remote_port"),
+        "proto": item.get("proto"),
+        "score": item.get("vpngate_score"),
+        "ping": item.get("vpngate_ping"),
+        "speed": item.get("vpngate_speed"),
+    }
+    temp_cfg = benchmark_temp_config(cfg)
+    result = benchmark_one_node_with_config(temp_cfg, cfg, node, ovpn_path.read_text(encoding="utf-8", errors="replace"), direct_ip, already_sanitized=True)
+    return result
+
+
+def benchmark_one_node_with_config(
+    cfg: InstanceConfig,
+    base_cfg: InstanceConfig,
+    node: dict[str, Any],
+    config_text: str,
+    direct_ip: str,
+    *,
+    already_sanitized: bool = False,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "node_id": node.get("id"),
+        "country_short": node.get("country_short"),
+        "country": node.get("country"),
+        "remote_host": node.get("remote_host"),
+        "remote_port": node.get("remote_port"),
+        "proto": node.get("proto"),
+        "vpngate_score": node.get("score"),
+        "vpngate_ping": node.get("ping"),
+        "vpngate_speed": node.get("speed"),
+        "connect_ok": False,
+        "proxy_ok": False,
+        "exit_ip": "",
+        "connect_ms": None,
+        "proxy_latency_ms": None,
+        "ip_quality_ok": None,
+        "ip_quality_score": None,
+        "ip_quality": {},
+        "download_bytes": None,
+        "download_ms": None,
+        "measured_at": iso_now(),
+        "error": "",
+        "final_score": 0.0,
+    }
+    openvpn_proc: subprocess.Popen[str] | None = None
+    proxy_proc: subprocess.Popen[str] | None = None
+    forwarder: PortForwarder | None = None
+    try:
+        cfg.ensure_dirs()
+        setup_namespace(cfg)
+        started = time.time()
+        openvpn_proc = start_openvpn(cfg, node, config_text, already_sanitized=already_sanitized)
+        result["connect_ms"] = int((time.time() - started) * 1000)
+        result["connect_ok"] = True
+        proxy_proc = start_proxy_in_namespace(cfg)
+        forwarder = PortForwarder(cfg)
+        forwarder.start()
+        time.sleep(0.5)
+        proxy_started = time.time()
+        exit_ip = http_get_via_socks5(cfg.proxy_bind_host, cfg.proxy_port, BENCHMARK_IP_URL, timeout=15)
+        result["proxy_latency_ms"] = int((time.time() - proxy_started) * 1000)
+        result["exit_ip"] = exit_ip
+        result["proxy_ok"] = bool(exit_ip and exit_ip != direct_ip)
+        if not result["proxy_ok"]:
+            result["error"] = f"出口 IP 未变化: direct={direct_ip or '-'} proxy={exit_ip or '-'}"
+    except Exception as exc:
+        result["error"] = str(exc)
+        log(base_cfg, f"Candidate health benchmark failed {node.get('id')}: {exc}")
+    finally:
+        if forwarder:
+            forwarder.stop()
+        terminate_process(proxy_proc)
+        terminate_process(openvpn_proc)
+        cleanup_namespace(cfg)
+        try:
+            cfg.generated_ovpn_file.unlink()
+        except FileNotFoundError:
+            pass
+    result["final_score"] = compute_final_score(result)
+    return result
+
+
 def benchmark_instance(cfg: InstanceConfig, *, download_test: bool = False) -> list[dict[str, Any]]:
     cfg.ensure_dirs()
     apply_retention(cfg)
@@ -1086,6 +1213,7 @@ def benchmark_instance(cfg: InstanceConfig, *, download_test: bool = False) -> l
     temp_cfg = benchmark_temp_config(cfg)
     for index, node in enumerate(nodes, 1):
         log(cfg, f"Benchmark {cfg.instance_id}: [{index}/{len(nodes)}] {node.get('id')} {node.get('remote_host')}:{node.get('remote_port')}")
+        cache_benchmark_ovpn(cfg, node)
         result = benchmark_one_node(temp_cfg, cfg, node, direct_ip, download_test=download_test)
         results.append(result)
         write_json(cfg.benchmark_file, results)
@@ -1241,8 +1369,78 @@ def scheduled_optimize_loop(cfg: InstanceConfig, switch_event: threading.Event, 
             set_state(cfg, scheduled_benchmark_error=str(exc), scheduled_benchmark_error_at=iso_now())
 
 
+def health_check_loop(cfg: InstanceConfig, switch_event: threading.Event, stop_event: threading.Event) -> None:
+    interval = cfg.health_check_interval_seconds
+    if interval <= 0:
+        return
+    log(cfg, f"Health check enabled: interval={interval}s")
+    while not stop_event.wait(interval):
+        try:
+            started = time.time()
+            exit_ip = http_get_via_socks5(cfg.proxy_bind_host, cfg.proxy_port, BENCHMARK_IP_URL, timeout=15)
+            latency = int((time.time() - started) * 1000)
+            set_state(cfg, last_health_check_at=iso_now(), last_health_ok=True, last_health_exit_ip=exit_ip, last_health_latency_ms=latency)
+            log(cfg, f"Health check OK: exit_ip={exit_ip} latency_ms={latency}")
+            continue
+        except Exception as exc:
+            reason = str(exc)
+            log(cfg, f"Health check failed; testing benchmark candidates: {reason}")
+            set_state(cfg, last_health_check_at=iso_now(), last_health_ok=False, last_health_error=reason)
+
+        ranked = benchmark_ranked_results(cfg)
+        if not ranked:
+            log(cfg, "Health check has no benchmark ranking; requesting instance restart")
+            set_state(cfg, health_restart_reason="no benchmark ranking", health_restart_at=iso_now())
+            switch_event.set()
+            return
+
+        direct_ip = ""
+        try:
+            direct_ip = public_ip_direct()
+        except Exception as exc:
+            log(cfg, f"WARNING: failed to detect direct VPS IP for health candidates: {exc}")
+
+        top_candidates = ranked[:3]
+        tested: list[dict[str, Any]] = []
+        selected: dict[str, Any] | None = None
+        for item in top_candidates:
+            result = benchmark_cached_result_candidate(cfg, item, direct_ip)
+            tested.append(result)
+            if result.get("connect_ok") and result.get("proxy_ok"):
+                selected = result
+                break
+
+        if selected is None:
+            top_ids = {str(item.get("node_id") or "") for item in top_candidates}
+            pool = [item for item in ranked if str(item.get("node_id") or "") not in top_ids]
+            random_candidates = random.sample(pool, min(3, len(pool))) if pool else []
+            for item in random_candidates:
+                result = benchmark_cached_result_candidate(cfg, item, direct_ip)
+                tested.append(result)
+                if result.get("connect_ok") and result.get("proxy_ok"):
+                    selected = result
+                    break
+
+        set_state(
+            cfg,
+            last_health_candidate_test_at=iso_now(),
+            last_health_tested_nodes=[item.get("node_id") for item in tested],
+            last_health_found_replacement=bool(selected),
+        )
+        if selected:
+            log(cfg, f"Health check selected replacement node {selected.get('node_id')}; requesting instance restart")
+            set_state(cfg, health_selected_node=selected.get("node_id"), health_switch_at=iso_now())
+            switch_event.set()
+            return
+
+        log(cfg, "Health check candidates all failed; requesting instance restart")
+        set_state(cfg, health_restart_reason="top3 and random3 failed", health_restart_at=iso_now())
+        switch_event.set()
+        return
+
+
 def no_node_retry_seconds(cfg: InstanceConfig) -> int:
-    return cfg.benchmark_interval_seconds if cfg.benchmark_interval_seconds > 0 else DEFAULT_NO_NODE_RETRY_SECONDS
+    return cfg.health_check_interval_seconds if cfg.health_check_interval_seconds > 0 else DEFAULT_NO_NODE_RETRY_SECONDS
 
 
 def wait_before_no_node_retry(cfg: InstanceConfig, stop_event: threading.Event, reason: str) -> bool:
@@ -1384,6 +1582,7 @@ def run_instance(args: argparse.Namespace) -> None:
         proxy_proc = start_proxy_in_namespace(cfg)
         forwarder = PortForwarder(cfg)
         forwarder.start()
+        threading.Thread(target=health_check_loop, args=(cfg, switch_event, stop_event), daemon=True).start()
         threading.Thread(target=scheduled_optimize_loop, args=(cfg, switch_event, stop_event), daemon=True).start()
         time.sleep(1)
         exit_ip = ""
@@ -1407,7 +1606,7 @@ def run_instance(args: argparse.Namespace) -> None:
         )
         while not stop_event.is_set():
             if switch_event.is_set():
-                raise RuntimeError("定时测速选择了新的最优节点，触发实例重启以切换出口")
+                raise RestartRequested("后台检查请求重启实例以切换或恢复出口")
             if openvpn_proc.poll() is not None:
                 reason = "OpenVPN 进程已退出"
                 log(cfg, f"{reason}; trying next node in the same country")
@@ -1451,6 +1650,10 @@ def run_instance(args: argparse.Namespace) -> None:
                 set_state(cfg, status="running", selected_node=current_node_id, selection_source=load_json(cfg.selected_node_file, {}).get("selection_source", "unknown"))
                 continue
             time.sleep(2)
+    except RestartRequested as exc:
+        log(cfg, f"RESTART: {exc}")
+        set_state(cfg, status="restarting", restart_reason=str(exc))
+        raise
     except Exception as exc:
         log(cfg, f"FATAL: {exc}")
         set_state(cfg, status="failed", error=str(exc))
@@ -1535,7 +1738,7 @@ def status_instance(args: argparse.Namespace) -> None:
         print(f"  service: {'active' if service_is_active(iid) else 'inactive'}")
         print(f"  proxy: socks/http {cfg.proxy_bind_host}:{cfg.proxy_port}")
         print(f"  country_filter: {cfg.country_filter or 'all'}")
-        print(f"  selection_policy: mode={cfg.node_selection_mode} interval={cfg.benchmark_interval_seconds}s sticky_min_score={cfg.sticky_min_final_score} sticky_max_latency={cfg.sticky_max_proxy_latency_ms}ms")
+        print(f"  selection_policy: mode={cfg.node_selection_mode} health_interval={cfg.health_check_interval_seconds}s benchmark_interval={cfg.benchmark_interval_seconds}s sticky_min_score={cfg.sticky_min_final_score} sticky_max_latency={cfg.sticky_max_proxy_latency_ms}ms")
         print(f"  ip_quality: enabled={cfg.ip_quality_enabled} ipdata_key={'set' if cfg.ipdata_api_key else 'not_set'}")
         print(f"  retention: enabled={cfg.retention_enabled} days={cfg.retention_days}")
         print(f"  namespace: {cfg.namespace} dev={cfg.openvpn_dev_name}")
@@ -1610,6 +1813,8 @@ def policy_instance(args: argparse.Namespace) -> None:
     values = parse_env_file(path)
     if args.selection_mode:
         values["NODE_SELECTION_MODE"] = args.selection_mode
+    if args.health_check_interval is not None:
+        values["HEALTH_CHECK_INTERVAL_SECONDS"] = max(0, args.health_check_interval)
     if args.benchmark_interval is not None:
         values["BENCHMARK_INTERVAL_SECONDS"] = max(0, args.benchmark_interval)
     if args.sticky_min_score is not None:
@@ -1631,6 +1836,7 @@ def policy_instance(args: argparse.Namespace) -> None:
             {
                 "instance": iid,
                 "node_selection_mode": cfg.node_selection_mode,
+                "health_check_interval_seconds": cfg.health_check_interval_seconds,
                 "benchmark_interval_seconds": cfg.benchmark_interval_seconds,
                 "sticky_min_final_score": cfg.sticky_min_final_score,
                 "sticky_max_proxy_latency_ms": cfg.sticky_max_proxy_latency_ms,
@@ -1678,6 +1884,7 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument("--port", type=int, required=True)
     add.add_argument("--iptype", default="all")
     add.add_argument("--selection-mode", choices=["sticky", "benchmark"], default="sticky")
+    add.add_argument("--health-check-interval", type=int, default=DEFAULT_HEALTH_CHECK_INTERVAL_SECONDS, help="current-node health check interval in seconds; 0 disables it")
     add.add_argument("--benchmark-interval", type=int, default=DEFAULT_BENCHMARK_INTERVAL_SECONDS, help="scheduled benchmark interval in seconds; 0 disables it")
     add.add_argument("--sticky-min-score", type=float, default=30.0)
     add.add_argument("--sticky-max-latency", type=int, default=3000)
@@ -1728,6 +1935,7 @@ def build_parser() -> argparse.ArgumentParser:
     policy = sub.add_parser("policy")
     policy.add_argument("instance_id")
     policy.add_argument("--selection-mode", choices=["sticky", "benchmark"])
+    policy.add_argument("--health-check-interval", type=int, help="current-node health check interval in seconds; 0 disables it")
     policy.add_argument("--benchmark-interval", type=int, help="scheduled benchmark interval in seconds; 0 disables it")
     policy.add_argument("--sticky-min-score", type=float)
     policy.add_argument("--sticky-max-latency", type=int)

@@ -276,10 +276,10 @@ sudo en multi add kr --country "KR,韩国" --port 7929 --iptype all
 sudo en multi add us --country "US,美国" --port 7930 --iptype all
 ```
 
-新增实例时也可以直接设置节点选择策略和定时测速间隔。默认每 10 分钟测速一次；下面示例显式写出 600 秒并采用粘性选择：
+新增实例时也可以直接设置节点选择策略、健康检查间隔和完整测速间隔。默认每 10 分钟检查当前出口健康，每 1 小时重新拉取 VPNGate CSV 并完整 benchmark；下面示例显式写出默认值并采用粘性选择：
 
 ```bash
-sudo en multi add jp --country "JP,日本" --port 7928 --iptype all --selection-mode sticky --benchmark-interval 600
+sudo en multi add jp --country "JP,日本" --port 7928 --iptype all --selection-mode sticky --health-check-interval 600 --benchmark-interval 3600
 ```
 
 启动、停止和重启：
@@ -352,11 +352,15 @@ sudo en multi best jp
 已有实例可以通过 `policy` 调整策略：
 
 ```bash
-sudo en multi policy jp --benchmark-interval 600 --selection-mode sticky
+sudo en multi policy jp --health-check-interval 600 --benchmark-interval 3600 --selection-mode sticky
 sudo en multi restart jp
 ```
 
-`--benchmark-interval` 单位是秒，`600` 表示每 10 分钟测速一次，`0` 表示关闭运行期定时测速。策略变更写入实例 env 文件，实例正在运行时需要重启后生效。
+`--health-check-interval` 单位是秒，`600` 表示每 10 分钟检查当前实例出口是否还可用；`0` 表示关闭健康检查。
+
+`--benchmark-interval` 单位是秒，`3600` 表示每 1 小时重新拉取 VPNGate CSV 并完整 benchmark；`0` 表示关闭运行期完整 benchmark。
+
+策略变更写入实例 env 文件，实例正在运行时需要重启后生效。
 
 节点选择模式：
 
@@ -366,12 +370,16 @@ sudo en multi restart jp
 粘性阈值也可以调整：
 
 ```bash
-sudo en multi policy jp --selection-mode sticky --benchmark-interval 600 --sticky-min-score 30 --sticky-max-latency 3000
+sudo en multi policy jp --selection-mode sticky --health-check-interval 600 --benchmark-interval 3600 --sticky-min-score 30 --sticky-max-latency 3000
 ```
 
-实例运行中到达定时测速间隔后，会用临时 namespace 执行 benchmark，不污染宿主机默认路由，也不占用当前实例的 SOCKS5 端口。若策略选出了不同节点，服务会触发该国家实例重启；重启时会优先按上一次 `benchmark.json` 榜单从第一名开始选节点，榜单节点不可用就自动尝试下一名，不会跨国家切换。没有 benchmark 榜单时，才拉取 VPNGate CSV 并按默认排序选择第一节点。
+实例运行中每 10 分钟会先通过当前 SOCKS 出口访问 `http://api.ipify.org`，确认当前节点是否可用。如果当前出口失败，会用临时 namespace 测试上一次 `benchmark.json` 榜单前三名；如果前三名都失败，再从历史成功节点里随机抽 3 个测试。健康检查不会更新 `benchmark.json`，因为这类失败可能只是当前国家实例运行状态异常。测到可用替代节点后，会触发该国家实例重启并切到同国家可用节点。如果这 6 个候选都失败，也会重启该国家实例，让实例按启动逻辑重新建立 namespace、OpenVPN 和代理。
 
-如果某个国家实例当前没有任何节点可用，服务不会反复崩溃重启；实例会进入 `waiting_for_nodes` 状态，默认等待 10 分钟后重新拉取 VPNGate CSV 并执行测速，然后再尝试启动。若设置了 `--benchmark-interval`，无节点重试也会使用同一个间隔。每次定时测速和无节点重试测速之前都会先重新拉取一次 VPNGate 官方 CSV。
+每 1 小时会重新拉取 VPNGate CSV，过滤当前国家，执行完整 benchmark，更新 `benchmark.json`，再按 `sticky` 策略优选：当前常用节点还不错就继续使用，除非节点断联、延迟过高、分数过低或 IP 质量变差。
+
+重启时会优先按上一次 `benchmark.json` 榜单从第一名开始选节点，榜单节点不可用就自动尝试下一名，不会跨国家切换。没有 benchmark 榜单时，才拉取 VPNGate CSV 并按默认排序选择第一节点。
+
+如果某个国家实例当前没有任何节点可用，服务不会反复崩溃重启；实例会进入 `waiting_for_nodes` 状态，默认等待 10 分钟后重新拉取 VPNGate CSV 并执行测速，然后再尝试启动。若设置了 `--health-check-interval`，无节点重试也会使用同一个间隔。每次完整 benchmark 和无节点重试测速之前都会先重新拉取一次 VPNGate 官方 CSV。
 
 ### IP 质量检测
 
