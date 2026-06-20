@@ -28,7 +28,8 @@ INSTALL_DIR = Path(os.environ.get("EIANUN_INSTALL_DIR", "/opt/eianun-vpngate"))
 PYTHON_BIN = os.environ.get("PYTHON_BIN", sys.executable or "python3")
 BENCHMARK_IP_URL = "http://api.ipify.org"
 BENCHMARK_DOWNLOAD_URL = "http://speedtest.tele2.net/100KB.zip"
-DEFAULT_NO_NODE_RETRY_SECONDS = 3600
+DEFAULT_BENCHMARK_INTERVAL_SECONDS = 600
+DEFAULT_NO_NODE_RETRY_SECONDS = 600
 
 CONFIG_ROOT = Path("/etc/eianun-vpngate")
 INSTANCE_CONFIG_DIR = CONFIG_ROOT / "instances"
@@ -185,7 +186,7 @@ class InstanceConfig:
             auto_select_best_node=bool_value(env.get("AUTO_SELECT_BEST_NODE"), True),
             allow_active_switch=bool_value(env.get("ALLOW_ACTIVE_SWITCH"), True),
             node_selection_mode=(env.get("NODE_SELECTION_MODE") or "sticky").strip().lower(),
-            benchmark_interval_seconds=max(0, int_value(env.get("BENCHMARK_INTERVAL_SECONDS"), 0)),
+            benchmark_interval_seconds=max(0, int_value(env.get("BENCHMARK_INTERVAL_SECONDS"), DEFAULT_BENCHMARK_INTERVAL_SECONDS)),
             sticky_min_final_score=float_value(env.get("STICKY_MIN_FINAL_SCORE"), 30.0),
             sticky_max_proxy_latency_ms=max(1, int_value(env.get("STICKY_MAX_PROXY_LATENCY_MS"), 3000)),
             ip_quality_enabled=bool_value(env.get("IP_QUALITY_ENABLED"), bool(env.get("IPDATA_API_KEY") or os.environ.get("IPDATA_API_KEY"))),
@@ -228,7 +229,7 @@ def default_instance_values(
     iptype: str,
     *,
     selection_mode: str = "sticky",
-    benchmark_interval: int = 0,
+    benchmark_interval: int = DEFAULT_BENCHMARK_INTERVAL_SECONDS,
     sticky_min_score: float = 30.0,
     sticky_max_latency: int = 3000,
     ipdata_api_key: str = "",
@@ -1217,30 +1218,16 @@ def refresh_benchmark_before_retry(cfg: InstanceConfig) -> None:
         set_state(cfg, retry_benchmark_error=str(exc), retry_benchmark_error_at=iso_now())
 
 
-def choose_and_connect(cfg: InstanceConfig) -> tuple[dict[str, Any], subprocess.Popen[str]]:
+def choose_and_connect(cfg: InstanceConfig, failed_node_ids: set[str] | None = None) -> tuple[dict[str, Any], subprocess.Popen[str]]:
+    failed_node_ids = failed_node_ids or set()
     errors: list[str] = []
-    best = load_json(cfg.best_node_file, {})
-    if isinstance(best, dict) and best and cfg.best_ovpn_file.exists():
-        try:
-            node = dict(best)
-            node["id"] = node.get("id") or node.get("node_id")
-            log(cfg, f"Trying pinned benchmark best node {node.get('id')} from {cfg.best_ovpn_file}")
-            proc = start_openvpn(cfg, node, cfg.best_ovpn_file.read_text(encoding="utf-8", errors="replace"), already_sanitized=True)
-            selected = node_public_fields(node)
-            selected["selection_source"] = "benchmark_best"
-            write_json(cfg.selected_node_file, selected)
-            return node, proc
-        except Exception as exc:
-            errors.append(f"best {best.get('node_id') or best.get('id')}: {exc}")
-            log(cfg, f"Pinned best node failed, trying benchmark ranking: {exc}")
-
     ranked = benchmark_ranked_results(cfg)
     if ranked:
+        log(cfg, f"Trying nodes from last benchmark ranking: {len(ranked)} usable nodes")
         nodes_by_id = {str(n.get("id")): n for n in fetch_vpngate_nodes(cfg)}
-        best_id = str(best.get("node_id") or best.get("id") or "")
         for rank, item in enumerate(ranked, 1):
             node_id = str(item.get("node_id") or "")
-            if not node_id or node_id == best_id:
+            if not node_id or node_id in failed_node_ids:
                 continue
             node = nodes_by_id.get(node_id)
             if not node:
@@ -1254,6 +1241,7 @@ def choose_and_connect(cfg: InstanceConfig) -> tuple[dict[str, Any], subprocess.
                 write_json(cfg.selected_node_file, selected)
                 return node, proc
             except Exception as exc:
+                failed_node_ids.add(node_id)
                 errors.append(f"rank {rank} {node_id}: {exc}")
                 log(cfg, f"Benchmark ranked node failed: #{rank} {node_id} {exc}")
 
@@ -1262,7 +1250,9 @@ def choose_and_connect(cfg: InstanceConfig) -> tuple[dict[str, Any], subprocess.
     log(cfg, f"VPNGate fetched/filtered nodes: {len(nodes)}")
     if not nodes:
         raise NoUsableNodes("没有可用 VPNGate 节点")
-    for node in nodes[: max(1, cfg.auto_test_workers * 4)]:
+    for node in nodes:
+        if str(node.get("id") or "") in failed_node_ids:
+            continue
         try:
             log(cfg, f"Trying node {node['id']} {node.get('country_short')} {node.get('remote_host')}:{node.get('remote_port')} score={node.get('score')} ping={node.get('ping')} speed={node.get('speed')}")
             proc = start_openvpn(cfg, node)
@@ -1271,9 +1261,40 @@ def choose_and_connect(cfg: InstanceConfig) -> tuple[dict[str, Any], subprocess.
             write_json(cfg.selected_node_file, selected)
             return node, proc
         except Exception as exc:
+            failed_node_ids.add(str(node.get("id") or ""))
             errors.append(f"{node.get('id')}: {exc}")
             log(cfg, f"Node failed: {node.get('id')} {exc}")
+    best = load_json(cfg.best_node_file, {})
+    if isinstance(best, dict) and best and cfg.best_ovpn_file.exists():
+        try:
+            node = dict(best)
+            node["id"] = node.get("id") or node.get("node_id")
+            if str(node.get("id") or "") in failed_node_ids:
+                raise NoUsableNodes(f"best node already failed in this cycle: {node.get('id')}")
+            log(cfg, f"Default list failed; trying pinned best node {node.get('id')} from {cfg.best_ovpn_file}")
+            proc = start_openvpn(cfg, node, cfg.best_ovpn_file.read_text(encoding="utf-8", errors="replace"), already_sanitized=True)
+            selected = node_public_fields(node)
+            selected["selection_source"] = "benchmark_best_fallback"
+            write_json(cfg.selected_node_file, selected)
+            return node, proc
+        except Exception as exc:
+            errors.append(f"best {best.get('node_id') or best.get('id')}: {exc}")
+            log(cfg, f"Pinned best fallback failed: {exc}")
     raise NoUsableNodes("OpenVPN 连接失败: " + "; ".join(errors[-5:]))
+
+
+def connect_with_wait(cfg: InstanceConfig, failed_node_ids: set[str], stop_event: threading.Event) -> tuple[dict[str, Any], subprocess.Popen[str]]:
+    while not stop_event.is_set():
+        try:
+            setup_namespace(cfg)
+            return choose_and_connect(cfg, failed_node_ids)
+        except NoUsableNodes as exc:
+            cleanup_namespace(cfg)
+            failed_node_ids.clear()
+            if wait_before_no_node_retry(cfg, stop_event, str(exc)):
+                raise SystemExit(0)
+            refresh_benchmark_before_retry(cfg)
+    raise SystemExit(0)
 
 
 def run_instance(args: argparse.Namespace) -> None:
@@ -1302,21 +1323,11 @@ def run_instance(args: argparse.Namespace) -> None:
 
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
+    failed_node_ids: set[str] = set()
+    current_node_id = ""
     try:
-        while not stop_event.is_set():
-            try:
-                setup_namespace(cfg)
-                node, openvpn_proc = choose_and_connect(cfg)
-                break
-            except NoUsableNodes as exc:
-                cleanup_namespace(cfg)
-                if wait_before_no_node_retry(cfg, stop_event, str(exc)):
-                    raise SystemExit(0)
-                refresh_benchmark_before_retry(cfg)
-        else:
-            raise SystemExit(0)
-        if openvpn_proc is None:
-            raise SystemExit(0)
+        node, openvpn_proc = connect_with_wait(cfg, failed_node_ids, stop_event)
+        current_node_id = str(node.get("id") or "")
         proxy_proc = start_proxy_in_namespace(cfg)
         forwarder = PortForwarder(cfg)
         forwarder.start()
@@ -1345,9 +1356,47 @@ def run_instance(args: argparse.Namespace) -> None:
             if switch_event.is_set():
                 raise RuntimeError("定时测速选择了新的最优节点，触发实例重启以切换出口")
             if openvpn_proc.poll() is not None:
-                raise RuntimeError("OpenVPN 进程已退出")
+                reason = "OpenVPN 进程已退出"
+                log(cfg, f"{reason}; trying next node in the same country")
+                if current_node_id:
+                    failed_node_ids.add(current_node_id)
+                set_state(cfg, status="switching", error=reason, failed_node=current_node_id)
+                terminate_process(proxy_proc)
+                proxy_proc = None
+                if forwarder:
+                    forwarder.stop()
+                    forwarder = None
+                terminate_process(openvpn_proc)
+                openvpn_proc = None
+                cleanup_namespace(cfg)
+                node, openvpn_proc = connect_with_wait(cfg, failed_node_ids, stop_event)
+                current_node_id = str(node.get("id") or "")
+                proxy_proc = start_proxy_in_namespace(cfg)
+                forwarder = PortForwarder(cfg)
+                forwarder.start()
+                set_state(cfg, status="running", selected_node=current_node_id, selection_source=load_json(cfg.selected_node_file, {}).get("selection_source", "unknown"))
+                continue
             if proxy_proc.poll() is not None:
-                raise RuntimeError("代理进程已退出")
+                reason = "代理进程已退出"
+                log(cfg, f"{reason}; trying next node in the same country")
+                if current_node_id:
+                    failed_node_ids.add(current_node_id)
+                set_state(cfg, status="switching", error=reason, failed_node=current_node_id)
+                terminate_process(proxy_proc)
+                proxy_proc = None
+                terminate_process(openvpn_proc)
+                openvpn_proc = None
+                if forwarder:
+                    forwarder.stop()
+                    forwarder = None
+                cleanup_namespace(cfg)
+                node, openvpn_proc = connect_with_wait(cfg, failed_node_ids, stop_event)
+                current_node_id = str(node.get("id") or "")
+                proxy_proc = start_proxy_in_namespace(cfg)
+                forwarder = PortForwarder(cfg)
+                forwarder.start()
+                set_state(cfg, status="running", selected_node=current_node_id, selection_source=load_json(cfg.selected_node_file, {}).get("selection_source", "unknown"))
+                continue
             time.sleep(2)
     except Exception as exc:
         log(cfg, f"FATAL: {exc}")
@@ -1567,7 +1616,7 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument("--port", type=int, required=True)
     add.add_argument("--iptype", default="all")
     add.add_argument("--selection-mode", choices=["sticky", "benchmark"], default="sticky")
-    add.add_argument("--benchmark-interval", type=int, default=0, help="scheduled benchmark interval in seconds; 0 disables it")
+    add.add_argument("--benchmark-interval", type=int, default=DEFAULT_BENCHMARK_INTERVAL_SECONDS, help="scheduled benchmark interval in seconds; 0 disables it")
     add.add_argument("--sticky-min-score", type=float, default=30.0)
     add.add_argument("--sticky-max-latency", type=int, default=3000)
     add.add_argument("--ip-quality", choices=["true", "false"], default="true")
