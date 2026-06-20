@@ -2,26 +2,27 @@
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import csv
+import hashlib
 import json
 import os
 import queue
+import random
 import re
-import select
 import shlex
 import socket
 import subprocess
+import sys
 import threading
 import time
 import urllib.parse
 import urllib.request
+import uuid
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-import concurrent.futures
-import sys
-import uuid
 
 # Force socket to resolve IPv4 only to avoid slow AAAA (IPv6) DNS resolution timeouts (e.g. in WSL)
 _orig_getaddrinfo = socket.getaddrinfo
@@ -31,8 +32,8 @@ def _ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
     return _orig_getaddrinfo(host, port, family, type, proto, flags)
 socket.getaddrinfo = _ipv4_getaddrinfo
 
-import vpn_utils
-import proxy_server
+import vpn_utils  # noqa: E402
+import proxy_server  # noqa: E402
 
 API_URL = "https://www.vpngate.net/api/iphone/"
 VPNBOOK_OPENVPN_URL = os.environ.get("VPNBOOK_OPENVPN_URL", "https://www.vpnbook.com/freevpn/openvpn")
@@ -158,9 +159,6 @@ def read_json(path: Path, default: Any) -> Any:
             return json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return default
-
-import hashlib
-import random
 
 def generate_random_password() -> str:
     import string
@@ -2134,7 +2132,7 @@ def test_multiple_nodes(node_ids: list[str], progress_prefix: str = "正在自�
         temp_path = Path(config_file)
         try:
             CONFIG_DIR.mkdir(exist_ok=True, parents=True)
-            temp_path.write_text(config_text, encoding="utf-8")
+            temp_path.write_text(sanitize_openvpn_config_for_eianun(config_text), encoding="utf-8")
         except Exception:
             pass
             
@@ -2593,7 +2591,7 @@ def maintain_valid_nodes(force: bool = False, target_override: list[str] | None 
                 config_path = Path(n["config_file"])
                 if not config_path.exists():
                     try:
-                        config_path.write_text(n["config_text"], encoding="utf-8")
+                        config_path.write_text(sanitize_openvpn_config_for_eianun(n["config_text"]), encoding="utf-8")
                     except Exception:
                         pass
                         
@@ -2659,7 +2657,7 @@ def maintain_valid_nodes(force: bool = False, target_override: list[str] | None 
         if sync_test_ids:
             test_multiple_nodes(sync_test_ids, progress_prefix="正在检测首批节点")
         elif skipped_vpnbook_auto:
-            set_state(last_check_message=f"VPNBook 节点已加入节点池，正在后台做安全检测：只测 TCP 可达和 IP 风控，不会启动 OpenVPN。")
+            set_state(last_check_message="VPNBook 节点已加入节点池，正在后台做安全检测：只测 TCP 可达和 IP 风控，不会启动 OpenVPN。")
 
         if safe_vpnbook_ids:
             run_vpnbook_safe_tests_background(safe_vpnbook_ids)
@@ -5448,7 +5446,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         effective_path = self.validate_path()
-        if effective_path == "": return
+        if effective_path == "":
+            return
         
         if not self.is_authorized():
             if effective_path in ("/", "/index.html"):
@@ -5513,7 +5512,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         effective_path = self.validate_path()
-        if effective_path == "": return
+        if effective_path == "":
+            return
         
         if effective_path == "/api/login":
             try:

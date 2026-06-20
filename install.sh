@@ -1196,6 +1196,10 @@ def gen():
 try:
  d=json.load(open(p,encoding='utf-8')); print(d.get('password') or gen())
 except Exception: print(gen())" 2>/dev/null)"
+NODE_SOURCES_INPUT="$(${PYTHON_BIN} -c "import json; p='$AUTH_FILE'
+try:
+ d=json.load(open(p,encoding='utf-8')); print(d.get('node_sources','vpngate,vpnbook,ipspeed'))
+except Exception: print('vpngate,vpnbook,ipspeed')" 2>/dev/null || echo 'vpngate,vpnbook,ipspeed')"
 TARGET_COUNTRIES_INPUT="$(${PYTHON_BIN} -c "import json; p='$AUTH_FILE'
 try:
  d=json.load(open(p,encoding='utf-8')); print(d.get('target_countries',''))
@@ -1257,7 +1261,7 @@ case "$is_custom" in
 esac
 
 if [ "$NEED_WRITE" = "1" ]; then
-    AUTH_FILE="$AUTH_FILE" UI_PORT="$UI_PORT" SECRET_PATH="$SECRET_PATH" UI_USERNAME="$UI_USERNAME" UI_PASSWORD="$UI_PASSWORD" TARGET_COUNTRIES_INPUT="$TARGET_COUNTRIES_INPUT" TARGET_IP_TYPES_INPUT="$TARGET_IP_TYPES_INPUT" ${PYTHON_BIN} - <<'PY_SAVE_AUTH'
+    AUTH_FILE="$AUTH_FILE" UI_PORT="$UI_PORT" SECRET_PATH="$SECRET_PATH" UI_USERNAME="$UI_USERNAME" UI_PASSWORD="$UI_PASSWORD" NODE_SOURCES_INPUT="$NODE_SOURCES_INPUT" TARGET_COUNTRIES_INPUT="$TARGET_COUNTRIES_INPUT" TARGET_IP_TYPES_INPUT="$TARGET_IP_TYPES_INPUT" ${PYTHON_BIN} - <<'PY_SAVE_AUTH'
 import json
 import os
 cfg = {
