@@ -207,6 +207,8 @@ en uninstall   # 卸载
 /var/log/eianun-vpngate/jp.log
 ```
 
+推荐模型是 **一个国家一个实例**：例如 JP 实例只负责日本出口，KR 实例只负责韩国出口。每个国家实例内部会对该国家的 VPNGate 节点做真实连接测速，优选最稳定节点作为该国家出口；3x-ui/Xray 侧只需要给每个国家暴露一个 VLESS inbound，手机客户端策略组再按国家节点分组。
+
 ### 隔离方案
 
 多实例模式使用 **Linux network namespace + veth + host loopback forwarder**：
@@ -308,6 +310,61 @@ sudo en multi ports
 sudo en multi switch jp
 ```
 
+### 国家内节点测速与优选
+
+对某个国家实例执行完整 VPNGate 节点测速：
+
+```bash
+sudo en multi benchmark jp
+```
+
+脚本会读取 `jp` 实例的 `COUNTRY_FILTER`，拉取 VPNGate 官方 CSV API，过滤该国家所有带 `OpenVPN_ConfigData_Base64` 的节点，并逐个在临时 benchmark namespace 内真实连接测试：
+
+- 生成临时 OpenVPN 配置。
+- 在独立 namespace 中启动 OpenVPN。
+- 启动临时 HTTP/SOCKS5 代理和 host loopback forwarder。
+- 通过代理访问 `http://api.ipify.org`，确认出口 IP 不等于 VPS 原始公网 IP。
+- 记录连接耗时、代理请求延迟、VPNGate 原始 score/ping/speed 和最终得分。
+- 每个节点测试后清理 OpenVPN 进程、代理进程、临时 namespace 和临时文件。
+
+benchmark 结果保存到：
+
+```text
+/var/lib/eianun-vpngate/instances/jp/benchmark.json
+```
+
+查看该国家排名前 10 的节点：
+
+```bash
+sudo en multi best jp
+```
+
+`en multi status jp` 会显示当前选中节点、选择来源、benchmark 时间、当前节点排名、`final_score`、代理延迟和 benchmark 出口 IP，方便确认实例是否正在使用测速优选节点。
+
+测速并固定最优节点：
+
+```bash
+sudo en multi optimize jp
+```
+
+`optimize` 会先执行 benchmark，选择 `connect_ok=true` 且 `proxy_ok=true` 的最高 `final_score` 节点，写入：
+
+```text
+/var/lib/eianun-vpngate/instances/jp/best_node.json
+/var/lib/eianun-vpngate/instances/jp/best.ovpn
+```
+
+随后重启该国家实例。实例启动时会优先使用 `best.ovpn`；如果 best 节点启动失败，会回退到同国家 `benchmark.json` 排名里的下一个可用节点，不会跨国家切换。没有 benchmark 结果时才使用旧的 VPNGate 原始排序逻辑。
+
+批量优化所有国家实例：
+
+```bash
+sudo en multi benchmark all
+sudo en multi optimize all
+```
+
+`optimize all` 默认顺序执行，某个国家失败不会影响其他国家继续，最后输出汇总 JSON。低配 VPS 不建议手动并发运行多个 benchmark，以免同时拉起过多 OpenVPN 进程。
+
 ### 测试出口 IP
 
 ```bash
@@ -361,6 +418,8 @@ sudo en multi xray-snippet
 ```
 
 在 3-xui/Xray 中创建或编辑对应 VLESS inbound，确保 inboundTag 与规则中的 `vless-vpngate-jp`、`vless-vpngate-kr`、`vless-vpngate-us` 对应。
+
+每个国家只需要一个 VLESS inbound 指向该国家本地 SOCKS 出口，例如 JP inbound -> `127.0.0.1:7928`。国家内的几十个 VPNGate 节点由 `en multi benchmark/optimize` 在服务端内部测速和故障转移，客户端不需要感知这些底层节点。
 
 ### 从单实例 7928 迁移
 

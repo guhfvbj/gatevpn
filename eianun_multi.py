@@ -19,13 +19,15 @@ import time
 import shutil
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
 API_URL = "https://www.vpngate.net/api/iphone/"
 INSTALL_DIR = Path(os.environ.get("EIANUN_INSTALL_DIR", "/opt/eianun-vpngate"))
 PYTHON_BIN = os.environ.get("PYTHON_BIN", sys.executable or "python3")
+BENCHMARK_IP_URL = "http://api.ipify.org"
+BENCHMARK_DOWNLOAD_URL = "http://speedtest.tele2.net/100KB.zip"
 
 CONFIG_ROOT = Path("/etc/eianun-vpngate")
 INSTANCE_CONFIG_DIR = CONFIG_ROOT / "instances"
@@ -133,6 +135,9 @@ class InstanceConfig:
     generated_ovpn_file: Path
     state_file: Path
     nodes_file: Path
+    benchmark_file: Path
+    best_node_file: Path
+    best_ovpn_file: Path
     namespace: str
     host_veth: str
     ns_veth: str
@@ -170,6 +175,9 @@ class InstanceConfig:
             generated_ovpn_file=Path(env.get("GENERATED_OVPN_FILE") or state_dir / "current.ovpn"),
             state_file=state_dir / "state.json",
             nodes_file=state_dir / "nodes.json",
+            benchmark_file=state_dir / "benchmark.json",
+            best_node_file=state_dir / "best_node.json",
+            best_ovpn_file=state_dir / "best.ovpn",
             namespace=f"vg-{instance_id}",
             host_veth=f"vg{instance_id[:8]}h"[:15],
             ns_veth=f"vg{instance_id[:8]}n"[:15],
@@ -289,6 +297,62 @@ def load_json(path: Path, default: Any) -> Any:
 def write_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def iso_now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def public_ip_direct(timeout: int = 10) -> str:
+    req = urllib.request.Request(BENCHMARK_IP_URL, headers={"User-Agent": "eianun-vpngate-multi"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8", errors="replace").strip()
+
+
+def find_free_port(host: str = "127.0.0.1") -> int:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind((host, 0))
+        return int(sock.getsockname()[1])
+    finally:
+        sock.close()
+
+
+def node_public_fields(node: dict[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in node.items() if k != "config_text"}
+
+
+def benchmark_results_sorted(cfg: InstanceConfig, *, usable_only: bool = False) -> list[dict[str, Any]]:
+    data = load_json(cfg.benchmark_file, [])
+    if isinstance(data, dict):
+        results = data.get("results", [])
+    else:
+        results = data
+    if not isinstance(results, list):
+        return []
+    ranked = [r for r in results if not usable_only or (r.get("connect_ok") and r.get("proxy_ok"))]
+    ranked.sort(key=lambda r: float(r.get("final_score") or 0), reverse=True)
+    return ranked
+
+
+def benchmark_ranked_results(cfg: InstanceConfig) -> list[dict[str, Any]]:
+    return benchmark_results_sorted(cfg, usable_only=True)
+
+
+def compute_final_score(result: dict[str, Any]) -> float:
+    if not result.get("connect_ok") or not result.get("proxy_ok"):
+        return 0.0
+    vpngate_score = max(0, int_value(result.get("vpngate_score")))
+    vpngate_speed = max(0, int_value(result.get("vpngate_speed")))
+    vpngate_ping = max(0, int_value(result.get("vpngate_ping"), 999999))
+    connect_ms = max(1, int_value(result.get("connect_ms"), 999999))
+    proxy_latency_ms = max(1, int_value(result.get("proxy_latency_ms"), 999999))
+    score_part = min(vpngate_score / 10000.0, 100.0)
+    speed_part = min(vpngate_speed / 1_000_000.0, 100.0)
+    ping_part = max(0.0, 100.0 - (vpngate_ping / 5.0))
+    connect_part = max(0.0, 100.0 - (connect_ms / 250.0))
+    proxy_part = max(0.0, 100.0 - (proxy_latency_ms / 20.0))
+    return round(score_part * 0.15 + speed_part * 0.25 + ping_part * 0.15 + connect_part * 0.2 + proxy_part * 0.25, 3)
 
 
 def set_state(cfg: InstanceConfig, **items: Any) -> None:
@@ -529,8 +593,11 @@ def wait_openvpn_ready(cfg: InstanceConfig, proc: subprocess.Popen[str], timeout
     return False
 
 
-def start_openvpn(cfg: InstanceConfig, node: dict[str, Any]) -> subprocess.Popen[str]:
-    cfg.generated_ovpn_file.write_text(sanitize_openvpn_config(str(node["config_text"]), cfg), encoding="utf-8")
+def start_openvpn(cfg: InstanceConfig, node: dict[str, Any], config_text: str | None = None, *, already_sanitized: bool = False) -> subprocess.Popen[str]:
+    config_text = config_text if config_text is not None else str(node.get("config_text") or "")
+    if not config_text:
+        raise RuntimeError("节点缺少 OpenVPN 配置")
+    cfg.generated_ovpn_file.write_text(config_text if already_sanitized else sanitize_openvpn_config(config_text, cfg), encoding="utf-8")
     remote_route_ip = ""
     try:
         remote_route_ip = resolve_remote_for_route(str(node.get("remote_host") or node.get("ip") or ""))
@@ -594,6 +661,20 @@ def start_proxy_in_namespace(cfg: InstanceConfig) -> subprocess.Popen[str]:
     if proc.poll() is not None:
         raise RuntimeError("代理端口启动失败")
     return proc
+
+
+def terminate_process(proc: subprocess.Popen[str] | None, timeout: int = 8) -> None:
+    if not proc or proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            pass
 
 
 class PortForwarder:
@@ -696,18 +777,260 @@ def http_get_via_socks5(host: str, port: int, url: str, timeout: int = 15) -> st
         sock.close()
 
 
+def benchmark_temp_config(cfg: InstanceConfig) -> InstanceConfig:
+    temp_id = f"bm-{cfg.instance_id}"
+    host_ip, ns_ip = instance_veth_ips(temp_id)
+    port = find_free_port(cfg.proxy_bind_host)
+    return replace(
+        cfg,
+        instance_id=temp_id,
+        display_name=f"Benchmark-{cfg.instance_id}",
+        proxy_port=port,
+        runtime_dir=RUN_ROOT / temp_id,
+        log_file=cfg.log_file,
+        pid_file=RUN_ROOT / temp_id / "manager.pid",
+        generated_ovpn_file=cfg.state_file.parent / "benchmark-current.ovpn",
+        namespace=f"vg-{temp_id}"[:15],
+        host_veth=f"vg{temp_id[:8]}h"[:15],
+        ns_veth=f"vg{temp_id[:8]}n"[:15],
+        host_veth_ip=host_ip,
+        ns_veth_ip=ns_ip,
+        openvpn_dev_name=f"tun-{temp_id}"[:15],
+    )
+
+
+def benchmark_one_node(cfg: InstanceConfig, base_cfg: InstanceConfig, node: dict[str, Any], direct_ip: str, *, download_test: bool = False) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "node_id": node.get("id"),
+        "country_short": node.get("country_short"),
+        "country": node.get("country"),
+        "remote_host": node.get("remote_host"),
+        "remote_port": node.get("remote_port"),
+        "proto": node.get("proto"),
+        "vpngate_score": node.get("score"),
+        "vpngate_ping": node.get("ping"),
+        "vpngate_speed": node.get("speed"),
+        "connect_ok": False,
+        "proxy_ok": False,
+        "exit_ip": "",
+        "connect_ms": None,
+        "proxy_latency_ms": None,
+        "download_bytes": None,
+        "download_ms": None,
+        "measured_at": iso_now(),
+        "error": "",
+        "final_score": 0.0,
+    }
+    openvpn_proc: subprocess.Popen[str] | None = None
+    proxy_proc: subprocess.Popen[str] | None = None
+    forwarder: PortForwarder | None = None
+    try:
+        cfg.ensure_dirs()
+        setup_namespace(cfg)
+        started = time.time()
+        openvpn_proc = start_openvpn(cfg, node)
+        result["connect_ms"] = int((time.time() - started) * 1000)
+        result["connect_ok"] = True
+        proxy_proc = start_proxy_in_namespace(cfg)
+        forwarder = PortForwarder(cfg)
+        forwarder.start()
+        time.sleep(0.5)
+        proxy_started = time.time()
+        exit_ip = http_get_via_socks5(cfg.proxy_bind_host, cfg.proxy_port, BENCHMARK_IP_URL, timeout=15)
+        result["proxy_latency_ms"] = int((time.time() - proxy_started) * 1000)
+        result["exit_ip"] = exit_ip
+        result["proxy_ok"] = bool(exit_ip and exit_ip != direct_ip)
+        if not result["proxy_ok"]:
+            result["error"] = f"出口 IP 未变化: direct={direct_ip or '-'} proxy={exit_ip or '-'}"
+        if download_test and result["proxy_ok"]:
+            dl_started = time.time()
+            body = http_get_via_socks5(cfg.proxy_bind_host, cfg.proxy_port, BENCHMARK_DOWNLOAD_URL, timeout=20)
+            result["download_ms"] = int((time.time() - dl_started) * 1000)
+            result["download_bytes"] = len(body.encode("utf-8", errors="ignore"))
+    except Exception as exc:
+        result["error"] = str(exc)
+        log(base_cfg, f"Benchmark failed {node.get('id')}: {exc}")
+    finally:
+        if forwarder:
+            forwarder.stop()
+        terminate_process(proxy_proc)
+        terminate_process(openvpn_proc)
+        cleanup_namespace(cfg)
+        try:
+            cfg.generated_ovpn_file.unlink()
+        except FileNotFoundError:
+            pass
+    result["final_score"] = compute_final_score(result)
+    return result
+
+
+def benchmark_instance(cfg: InstanceConfig, *, download_test: bool = False) -> list[dict[str, Any]]:
+    cfg.ensure_dirs()
+    check_runtime_requirements()
+    direct_ip = ""
+    try:
+        direct_ip = public_ip_direct()
+    except Exception as exc:
+        log(cfg, f"WARNING: failed to detect direct VPS IP: {exc}")
+    nodes = fetch_vpngate_nodes(cfg)
+    log(cfg, f"Benchmark {cfg.instance_id}: testing {len(nodes)} VPNGate nodes; direct_ip={direct_ip or '-'}")
+    results: list[dict[str, Any]] = []
+    temp_cfg = benchmark_temp_config(cfg)
+    for index, node in enumerate(nodes, 1):
+        log(cfg, f"Benchmark {cfg.instance_id}: [{index}/{len(nodes)}] {node.get('id')} {node.get('remote_host')}:{node.get('remote_port')}")
+        result = benchmark_one_node(temp_cfg, cfg, node, direct_ip, download_test=download_test)
+        results.append(result)
+        write_json(cfg.benchmark_file, results)
+    results.sort(key=lambda r: float(r.get("final_score") or 0), reverse=True)
+    write_json(cfg.benchmark_file, results)
+    set_state(cfg, benchmark_at=iso_now(), benchmark_nodes=len(results), benchmark_ok=sum(1 for r in results if r.get("connect_ok") and r.get("proxy_ok")))
+    return results
+
+
+def benchmark_command(args: argparse.Namespace) -> None:
+    targets = iter_instances() if args.instance_id == "all" else [sanitize_instance_id(args.instance_id)]
+    summary: list[dict[str, Any]] = []
+    for iid in targets:
+        try:
+            cfg = InstanceConfig.load(iid)
+            results = benchmark_instance(cfg, download_test=args.download_test)
+            ok = sum(1 for r in results if r.get("connect_ok") and r.get("proxy_ok"))
+            best = results[0] if results else {}
+            summary.append({"instance": iid, "nodes": len(results), "ok": ok, "best": best.get("node_id"), "score": best.get("final_score")})
+        except Exception as exc:
+            summary.append({"instance": iid, "error": str(exc)})
+            print(f"[{iid}] benchmark failed: {exc}", file=sys.stderr)
+    print(json.dumps(summary if args.instance_id == "all" else summary[0], ensure_ascii=False, indent=2))
+
+
+def best_command(args: argparse.Namespace) -> None:
+    cfg = InstanceConfig.load(args.instance_id)
+    results = benchmark_results_sorted(cfg)
+    if not results:
+        die(f"{cfg.instance_id}: 没有可用 benchmark 结果，请先运行 en multi benchmark {cfg.instance_id}")
+    print(f"{'RANK':<5} {'NODE_ID':<32} {'EXIT_IP':<16} {'LAT_MS':<8} {'SPEED':<12} {'SCORE':<10} {'FINAL':<10}")
+    for rank, item in enumerate(results[:10], 1):
+        print(
+            f"{rank:<5} {str(item.get('node_id','-'))[:31]:<32} {str(item.get('exit_ip','-')):<16} "
+            f"{str(item.get('proxy_latency_ms','-')):<8} {str(item.get('vpngate_speed','-')):<12} "
+            f"{str(item.get('vpngate_score','-')):<10} {str(item.get('final_score','-')):<10}"
+        )
+
+
+def fetch_node_config_by_id(cfg: InstanceConfig, node_id: str) -> dict[str, Any] | None:
+    for node in fetch_vpngate_nodes(cfg):
+        if node.get("id") == node_id:
+            return node
+    return None
+
+
+def write_best_node(cfg: InstanceConfig, node: dict[str, Any], result: dict[str, Any]) -> None:
+    sanitized = sanitize_openvpn_config(str(node["config_text"]), cfg)
+    cfg.best_ovpn_file.write_text(sanitized, encoding="utf-8")
+    best_data = node_public_fields(node)
+    best_data.update(
+        {
+            "id": node.get("id"),
+            "node_id": node.get("id"),
+            "source": "benchmark",
+            "selected_at": iso_now(),
+            "benchmark_result": result,
+            "best_ovpn": str(cfg.best_ovpn_file),
+        }
+    )
+    write_json(cfg.best_node_file, best_data)
+
+
+def optimize_one(cfg: InstanceConfig, *, download_test: bool = False, restart: bool = True) -> dict[str, Any]:
+    results = benchmark_instance(cfg, download_test=download_test)
+    ranked = [r for r in results if r.get("connect_ok") and r.get("proxy_ok")]
+    ranked.sort(key=lambda r: float(r.get("final_score") or 0), reverse=True)
+    if not ranked:
+        raise RuntimeError("benchmark 未找到 connect_ok/proxy_ok 都通过的节点")
+    best_result = ranked[0]
+    node = fetch_node_config_by_id(cfg, str(best_result.get("node_id")))
+    if not node:
+        raise RuntimeError(f"无法重新获取最优节点配置: {best_result.get('node_id')}")
+    write_best_node(cfg, node, best_result)
+    set_state(
+        cfg,
+        best_node=node.get("id"),
+        best_source="benchmark",
+        best_selected_at=iso_now(),
+        best_final_score=best_result.get("final_score"),
+        best_exit_ip=best_result.get("exit_ip"),
+        best_proxy_latency_ms=best_result.get("proxy_latency_ms"),
+    )
+    if restart:
+        systemctl("restart", cfg.instance_id)
+    return {"instance": cfg.instance_id, "best": node.get("id"), "exit_ip": best_result.get("exit_ip"), "final_score": best_result.get("final_score"), "restarted": restart}
+
+
+def optimize_command(args: argparse.Namespace) -> None:
+    targets = iter_instances() if args.instance_id == "all" else [sanitize_instance_id(args.instance_id)]
+    summary: list[dict[str, Any]] = []
+    for iid in targets:
+        try:
+            cfg = InstanceConfig.load(iid)
+            summary.append(optimize_one(cfg, download_test=args.download_test, restart=not args.no_restart))
+        except Exception as exc:
+            summary.append({"instance": iid, "error": str(exc)})
+            print(f"[{iid}] optimize failed: {exc}", file=sys.stderr)
+    print(json.dumps(summary if args.instance_id == "all" else summary[0], ensure_ascii=False, indent=2))
+
+
 def choose_and_connect(cfg: InstanceConfig) -> tuple[dict[str, Any], subprocess.Popen[str]]:
+    errors: list[str] = []
+    best = load_json(cfg.best_node_file, {})
+    if isinstance(best, dict) and best and cfg.best_ovpn_file.exists():
+        try:
+            node = dict(best)
+            node["id"] = node.get("id") or node.get("node_id")
+            log(cfg, f"Trying pinned benchmark best node {node.get('id')} from {cfg.best_ovpn_file}")
+            proc = start_openvpn(cfg, node, cfg.best_ovpn_file.read_text(encoding="utf-8", errors="replace"), already_sanitized=True)
+            selected = node_public_fields(node)
+            selected["selection_source"] = "benchmark_best"
+            write_json(cfg.selected_node_file, selected)
+            return node, proc
+        except Exception as exc:
+            errors.append(f"best {best.get('node_id') or best.get('id')}: {exc}")
+            log(cfg, f"Pinned best node failed, trying benchmark ranking: {exc}")
+
+    ranked = benchmark_ranked_results(cfg)
+    if ranked:
+        nodes_by_id = {str(n.get("id")): n for n in fetch_vpngate_nodes(cfg)}
+        best_id = str(best.get("node_id") or best.get("id") or "")
+        for rank, item in enumerate(ranked, 1):
+            node_id = str(item.get("node_id") or "")
+            if not node_id or node_id == best_id:
+                continue
+            node = nodes_by_id.get(node_id)
+            if not node:
+                errors.append(f"rank {rank} {node_id}: config not found")
+                continue
+            try:
+                log(cfg, f"Trying benchmark ranked node #{rank} {node_id} final_score={item.get('final_score')}")
+                proc = start_openvpn(cfg, node)
+                selected = node_public_fields(node)
+                selected.update({"selection_source": "benchmark_ranked", "benchmark_rank": rank, "benchmark_result": item})
+                write_json(cfg.selected_node_file, selected)
+                return node, proc
+            except Exception as exc:
+                errors.append(f"rank {rank} {node_id}: {exc}")
+                log(cfg, f"Benchmark ranked node failed: #{rank} {node_id} {exc}")
+
     log(cfg, f"Fetching VPNGate nodes country_filter={cfg.country_filter or 'all'}")
     nodes = fetch_vpngate_nodes(cfg)
     log(cfg, f"VPNGate fetched/filtered nodes: {len(nodes)}")
     if not nodes:
         raise RuntimeError("没有可用 VPNGate 节点")
-    errors: list[str] = []
     for node in nodes[: max(1, cfg.auto_test_workers * 4)]:
         try:
             log(cfg, f"Trying node {node['id']} {node.get('country_short')} {node.get('remote_host')}:{node.get('remote_port')} score={node.get('score')} ping={node.get('ping')} speed={node.get('speed')}")
             proc = start_openvpn(cfg, node)
-            write_json(cfg.selected_node_file, {k: v for k, v in node.items() if k != "config_text"})
+            selected = node_public_fields(node)
+            selected["selection_source"] = "vpngate_default"
+            write_json(cfg.selected_node_file, selected)
             return node, proc
         except Exception as exc:
             errors.append(f"{node.get('id')}: {exc}")
@@ -750,6 +1073,7 @@ def run_instance(args: argparse.Namespace) -> None:
             cfg,
             status="running",
             selected_node=node["id"],
+            selection_source=load_json(cfg.selected_node_file, {}).get("selection_source", "unknown"),
             country=node.get("country"),
             country_short=node.get("country_short"),
             score=node.get("score"),
@@ -830,6 +1154,19 @@ def status_instance(args: argparse.Namespace) -> None:
         cfg = InstanceConfig.load(iid)
         state = load_json(cfg.state_file, {})
         selected = load_json(cfg.selected_node_file, {})
+        if not isinstance(selected, dict):
+            selected = {}
+        ranked = benchmark_ranked_results(cfg)
+        selected_id = selected.get("id", state.get("selected_node", "-"))
+        selected_rank = "-"
+        selected_benchmark = selected.get("benchmark_result") if isinstance(selected, dict) else None
+        for rank, item in enumerate(ranked, 1):
+            if item.get("node_id") == selected_id:
+                selected_rank = rank
+                selected_benchmark = item
+                break
+        if not isinstance(selected_benchmark, dict):
+            selected_benchmark = {}
         print(f"[{iid}] {cfg.display_name}")
         print(f"  service: {'active' if service_is_active(iid) else 'inactive'}")
         print(f"  proxy: socks/http {cfg.proxy_bind_host}:{cfg.proxy_port}")
@@ -837,9 +1174,15 @@ def status_instance(args: argparse.Namespace) -> None:
         print(f"  namespace: {cfg.namespace} dev={cfg.openvpn_dev_name}")
         print(f"  status: {state.get('status', '-')}")
         print(f"  exit_ip: {state.get('exit_ip', '-')}")
-        print(f"  selected_node: {selected.get('id', state.get('selected_node', '-'))}")
+        print(f"  selected_node: {selected_id}")
+        print(f"  selection_source: {selected.get('selection_source', state.get('selection_source', '-'))}")
         print(f"  node_country: {selected.get('country_short', state.get('country_short', '-'))} {selected.get('country', state.get('country', ''))}")
         print(f"  ping/speed/score: {selected.get('ping', state.get('ping', '-'))}/{selected.get('speed', state.get('speed', '-'))}/{selected.get('score', state.get('score', '-'))}")
+        print(f"  benchmark_time: {state.get('benchmark_at', '-')}")
+        print(f"  benchmark_rank: {selected_rank}")
+        print(f"  benchmark_final_score: {selected_benchmark.get('final_score', state.get('best_final_score', '-'))}")
+        print(f"  benchmark_proxy_latency_ms: {selected_benchmark.get('proxy_latency_ms', state.get('best_proxy_latency_ms', '-'))}")
+        print(f"  benchmark_exit_ip: {selected_benchmark.get('exit_ip', state.get('best_exit_ip', '-'))}")
         if state.get("error"):
             print(f"  error: {state['error']}")
 
@@ -941,6 +1284,18 @@ def build_parser() -> argparse.ArgumentParser:
     test = sub.add_parser("test")
     test.add_argument("instance_id")
     test.set_defaults(func=test_instance)
+    benchmark = sub.add_parser("benchmark")
+    benchmark.add_argument("instance_id", help="instance_id or all")
+    benchmark.add_argument("--download-test", action="store_true", help="also test a small HTTP download through the proxy")
+    benchmark.set_defaults(func=benchmark_command)
+    best = sub.add_parser("best")
+    best.add_argument("instance_id")
+    best.set_defaults(func=best_command)
+    optimize = sub.add_parser("optimize")
+    optimize.add_argument("instance_id", help="instance_id or all")
+    optimize.add_argument("--download-test", action="store_true", help="also test a small HTTP download during benchmark")
+    optimize.add_argument("--no-restart", action="store_true", help="write best_node.json and best.ovpn without restarting the instance")
+    optimize.set_defaults(func=optimize_command)
     switch = sub.add_parser("switch")
     switch.add_argument("instance_id")
     switch.set_defaults(func=switch_instance)
