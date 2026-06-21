@@ -382,6 +382,8 @@ sudo en multi policy jp --selection-mode sticky --health-check-interval 600 --be
 
 实例运行中每 10 分钟会先通过当前 SOCKS 出口访问 `http://api.ipify.org`，确认当前节点是否可用。如果当前出口失败，会用临时 namespace 测试上一次 `benchmark.json` 榜单前三名；如果前三名都失败，再从历史成功节点里随机抽 3 个测试。健康检查不会更新 `benchmark.json`，因为这类失败可能只是当前国家实例运行状态异常。测到可用替代节点后，会在当前进程内直接切换到该节点，不重启国家实例。如果这 6 个候选都失败，才重启该国家实例一次，让实例按启动逻辑重新建立 namespace、OpenVPN 和代理。若健康检查周期撞上 1 小时完整 benchmark，健康检查会跳过本轮，等下一个 10 分钟周期再跑，完整 benchmark 优先。
 
+状态机以正式 SOCKS 出口检测为准：只有 OpenVPN、namespace 内代理、host forwarder 都启动后，并且通过 `127.0.0.1:<端口>` SOCKS 访问 `api.ipify.org` 成功，实例才会写入 `running`。运行中如果 OpenVPN 或代理进程退出，或者正式 SOCKS 检测失败，会立即离开 `running` 并进入切换/等待流程。
+
 每 1 小时会重新拉取 VPNGate CSV，过滤当前国家，执行完整 benchmark，更新 `benchmark.json`，再按 `sticky` 策略优选：当前常用节点还不错就继续使用，除非节点断联、延迟过高、分数过低或 IP 质量变差。
 
 重启时会优先按上一次 `benchmark.json` 榜单从第一名开始选节点，榜单节点不可用就自动尝试下一名，不会跨国家切换。没有 benchmark 榜单时，才拉取 VPNGate CSV 并按默认排序选择第一节点。

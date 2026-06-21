@@ -662,6 +662,18 @@ def set_state(cfg: InstanceConfig, **items: Any) -> None:
     write_json(cfg.state_file, state)
 
 
+def set_not_running(cfg: InstanceConfig, status: str, reason: str = "", **items: Any) -> None:
+    payload = {
+        "status": status,
+        "runtime_ok": False,
+        "exit_ip": "",
+        "proxy_latency_ms": None,
+        "last_error": reason,
+    }
+    payload.update(items)
+    set_state(cfg, **payload)
+
+
 def retention_cutoff(cfg: InstanceConfig) -> float:
     return time.time() - (max(1, cfg.retention_days) * 86400)
 
@@ -1822,6 +1834,7 @@ def wait_before_no_node_retry(cfg: InstanceConfig, stop_event: threading.Event, 
     set_state(
         cfg,
         status="waiting_for_nodes",
+        runtime_ok=False,
         error=reason,
         last_error=reason,
         no_usable_nodes=True,
@@ -1971,6 +1984,7 @@ def connect_and_activate_with_wait(
             set_state(
                 cfg,
                 status="running",
+                runtime_ok=True,
                 selected_node=node_id,
                 selection_source=selected.get("selection_source", "unknown"),
                 country=node.get("country"),
@@ -1990,7 +2004,7 @@ def connect_and_activate_with_wait(
             if node_id:
                 failed_node_ids.add(node_id)
             log(cfg, f"Runtime activation failed for {node_id or 'unknown'}: {exc}")
-            set_state(cfg, status="switching", last_error=str(exc), failed_node=node_id)
+            set_not_running(cfg, "switching", str(exc), failed_node=node_id)
             stop_runtime(cfg, openvpn_proc, proxy_proc, forwarder)
             preferred = ""
             continue
@@ -2008,6 +2022,7 @@ def run_instance(args: argparse.Namespace) -> None:
     set_state(
         cfg,
         status="starting",
+        runtime_ok=False,
         instance_id=cfg.instance_id,
         proxy=f"{cfg.proxy_bind_host}:{cfg.proxy_port}",
         scheduled_switch_pending=False,
@@ -2028,6 +2043,7 @@ def run_instance(args: argparse.Namespace) -> None:
     signal.signal(signal.SIGINT, handle_signal)
     failed_node_ids: set[str] = set()
     current_node_id = ""
+    last_runtime_verify_at = 0.0
     try:
         node, openvpn_proc, proxy_proc, forwarder, exit_ip, _latency_ms = connect_and_activate_with_wait(
             cfg,
@@ -2051,7 +2067,7 @@ def run_instance(args: argparse.Namespace) -> None:
                     for failed_id in action_state.get("failed_node_ids") or []:
                         if failed_id:
                             failed_node_ids.add(str(failed_id))
-                    set_state(cfg, status="switching", switch_reason=reason, switch_to=node_id)
+                    set_not_running(cfg, "switching", reason, switch_to=node_id)
                     stop_runtime(cfg, openvpn_proc, proxy_proc, forwarder)
                     openvpn_proc = None
                     proxy_proc = None
@@ -2073,7 +2089,7 @@ def run_instance(args: argparse.Namespace) -> None:
                 log(cfg, f"{reason}; trying next node in the same country")
                 if current_node_id:
                     failed_node_ids.add(current_node_id)
-                set_state(cfg, status="switching", error=reason, failed_node=current_node_id)
+                set_not_running(cfg, "switching", reason, error=reason, failed_node=current_node_id)
                 stop_runtime(cfg, openvpn_proc, proxy_proc, forwarder)
                 proxy_proc = None
                 openvpn_proc = None
@@ -2091,7 +2107,7 @@ def run_instance(args: argparse.Namespace) -> None:
                 log(cfg, f"{reason}; trying next node in the same country")
                 if current_node_id:
                     failed_node_ids.add(current_node_id)
-                set_state(cfg, status="switching", error=reason, failed_node=current_node_id)
+                set_not_running(cfg, "switching", reason, error=reason, failed_node=current_node_id)
                 stop_runtime(cfg, openvpn_proc, proxy_proc, forwarder)
                 proxy_proc = None
                 openvpn_proc = None
@@ -2104,14 +2120,38 @@ def run_instance(args: argparse.Namespace) -> None:
                 )
                 current_node_id = str(node.get("id") or "")
                 continue
+            now = time.time()
+            if now - last_runtime_verify_at >= min(60, max(10, cfg.health_check_interval_seconds or 60)):
+                last_runtime_verify_at = now
+                try:
+                    runtime_exit_ip, runtime_latency_ms = verify_runtime_proxy(cfg, timeout=10)
+                    set_state(cfg, runtime_ok=True, exit_ip=runtime_exit_ip, proxy_latency_ms=runtime_latency_ms, last_runtime_verify_at=iso_now())
+                except Exception as exc:
+                    reason = f"正式 SOCKS 健康检查失败: {exc}"
+                    log(cfg, f"{reason}; trying next node in the same country")
+                    if current_node_id:
+                        failed_node_ids.add(current_node_id)
+                    set_not_running(cfg, "switching", reason, error=reason, failed_node=current_node_id)
+                    stop_runtime(cfg, openvpn_proc, proxy_proc, forwarder)
+                    proxy_proc = None
+                    openvpn_proc = None
+                    forwarder = None
+                    node, openvpn_proc, proxy_proc, forwarder, _exit_ip, _latency_ms = connect_and_activate_with_wait(
+                        cfg,
+                        failed_node_ids,
+                        stop_event,
+                        activation_reason="runtime_proxy_verify_failed",
+                    )
+                    current_node_id = str(node.get("id") or "")
+                    continue
             time.sleep(2)
     except RestartRequested as exc:
         log(cfg, f"RESTART: {exc}")
-        set_state(cfg, status="restarting", restart_reason=str(exc))
+        set_not_running(cfg, "restarting", str(exc), restart_reason=str(exc))
         raise
     except Exception as exc:
         log(cfg, f"FATAL: {exc}")
-        set_state(cfg, status="failed", error=str(exc))
+        set_not_running(cfg, "failed", str(exc), error=str(exc))
         raise
     finally:
         if forwarder:
@@ -2124,7 +2164,9 @@ def run_instance(args: argparse.Namespace) -> None:
                 except subprocess.TimeoutExpired:
                     proc.kill()
         cleanup_namespace(cfg)
-        set_state(cfg, status="stopped")
+        state = load_json(cfg.state_file, {})
+        if state.get("status") not in {"restarting", "failed", "waiting_for_nodes"}:
+            set_not_running(cfg, "stopped", "process stopped")
         try:
             cfg.pid_file.unlink()
         except FileNotFoundError:
